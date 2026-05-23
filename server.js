@@ -10,11 +10,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Railway requires dynamic port
 const PORT = process.env.PORT || 3000;
 
 /* ----------------------------
-   ENV DEBUG (IMPORTANT)
+   ENV DEBUG
 ---------------------------- */
 console.log("SUPABASE_URL =", process.env.SUPABASE_URL);
 console.log("SUPABASE_KEY exists =", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
@@ -22,9 +21,8 @@ console.log("HF_TOKEN exists =", !!process.env.HF_TOKEN);
 console.log("GROQ_KEY exists =", !!process.env.GROQ_API_KEY);
 
 /* ----------------------------
-   CLIENTS (SAFE INIT)
+   SAFE SUPABASE INIT
 ---------------------------- */
-
 let supabase;
 
 function initSupabase() {
@@ -41,6 +39,9 @@ function initSupabase() {
   return supabase;
 }
 
+/* ----------------------------
+   CLIENTS
+---------------------------- */
 const hf = new InferenceClient(process.env.HF_TOKEN);
 
 const groq = new Groq({
@@ -58,7 +59,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// DEBUG ENV
+// Debug env
 app.get('/debug-env', (req, res) => {
   res.json({
     SUPABASE_URL: process.env.SUPABASE_URL || null,
@@ -68,7 +69,9 @@ app.get('/debug-env', (req, res) => {
   });
 });
 
-// MAIN ASK ROUTE
+/* ----------------------------
+   MAIN ASK ROUTE (IMPROVED)
+---------------------------- */
 app.get('/ask', async (req, res) => {
   try {
     const question = req.query.q;
@@ -79,18 +82,18 @@ app.get('/ask', async (req, res) => {
       });
     }
 
-    // Create embedding
+    // Embedding
     const queryEmbedding = await hf.featureExtraction({
       model: 'sentence-transformers/all-MiniLM-L6-v2',
       inputs: question,
     });
 
-    // SAFE SUPABASE CALL
+    // Supabase search
     const client = initSupabase();
 
     const { data: laws, error } = await client.rpc('match_laws', {
       query_embedding: queryEmbedding,
-      match_count: 5,
+      match_count: 3, // reduced for precision
     });
 
     if (error) {
@@ -105,19 +108,29 @@ app.get('/ask', async (req, res) => {
       });
     }
 
-    // Build context
-    const context = laws.map((law) => `
-SIMILARITY: ${law.similarity}
+    // 🧠 Use ONLY best match (critical fix)
+    const bestLaw = laws[0];
 
-LAW: ${law.law_name}
-ARTICLE: ${law.article_number}
-TITLE: ${law.title}
+    // Confidence filter (prevents weak matches)
+    if (bestLaw.similarity < 0.5) {
+      return res.json({
+        answer: "No strong legal match found in the database.",
+        citations: [],
+      });
+    }
+
+    const context = `
+SIMILARITY: ${bestLaw.similarity}
+
+LAW: ${bestLaw.law_name}
+ARTICLE: ${bestLaw.article_number}
+TITLE: ${bestLaw.title}
 
 TEXT:
-${law.text}
-`).join('\n-------------------------\n');
+${bestLaw.text}
+`;
 
-    // Groq call
+    // Groq response
     const completion = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
       temperature: 0.1,
@@ -128,11 +141,12 @@ ${law.text}
 You are XeerHub, a Somali legal research assistant.
 
 Rules:
-1. Use ONLY provided legal context
-2. Do not invent laws
-3. Always cite law name, article number, title
-4. Be concise and professional
-5. Respond in user language when possible
+1. Use ONLY the provided legal context
+2. Do NOT combine multiple laws
+3. Do NOT invent legal information
+4. Always cite law name, article number, and title
+5. Be concise and legally precise
+6. Respond in the user's language when possible
           `,
         },
         {
@@ -148,12 +162,14 @@ Rules:
 
     return res.json({
       answer,
-      citations: laws.map((law) => ({
-        law: law.law_name,
-        article: law.article_number,
-        title: law.title,
-        similarity: law.similarity,
-      })),
+      citations: [
+        {
+          law: bestLaw.law_name,
+          article: bestLaw.article_number,
+          title: bestLaw.title,
+          similarity: bestLaw.similarity,
+        },
+      ],
     });
 
   } catch (err) {
