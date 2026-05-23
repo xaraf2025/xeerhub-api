@@ -4,8 +4,7 @@ import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import { InferenceClient } from '@huggingface/inference';
 import Groq from 'groq-sdk';
-console.log("SUPABASE_URL =", process.env.SUPABASE_URL);
-console.log("SUPABASE_KEY exists =", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+
 const app = express();
 
 app.use(cors());
@@ -14,6 +13,24 @@ app.use(express.json());
 // Railway requires dynamic port
 const PORT = process.env.PORT || 3000;
 
+/* ----------------------------
+   ENV DEBUG (IMPORTANT)
+---------------------------- */
+console.log("SUPABASE_URL =", process.env.SUPABASE_URL);
+console.log("SUPABASE_KEY exists =", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+console.log("HF_TOKEN exists =", !!process.env.HF_TOKEN);
+console.log("GROQ_KEY exists =", !!process.env.GROQ_API_KEY);
+
+/* ----------------------------
+   SAFETY CHECK (prevents crash)
+---------------------------- */
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("Missing Supabase environment variables");
+}
+
+/* ----------------------------
+   CLIENTS
+---------------------------- */
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -25,6 +42,28 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
+/* ----------------------------
+   ROUTES
+---------------------------- */
+
+// Health check
+app.get('/', (req, res) => {
+  res.json({
+    status: 'XeerHub API running',
+  });
+});
+
+// DEBUG ENV (THIS IS WHAT YOU NEED NOW)
+app.get('/debug-env', (req, res) => {
+  res.json({
+    SUPABASE_URL: process.env.SUPABASE_URL || null,
+    SUPABASE_KEY_EXISTS: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+    HF_TOKEN_EXISTS: !!process.env.HF_TOKEN,
+    GROQ_KEY_EXISTS: !!process.env.GROQ_API_KEY,
+  });
+});
+
+// MAIN ASK ROUTE
 app.get('/ask', async (req, res) => {
   try {
     const question = req.query.q;
@@ -60,9 +99,7 @@ app.get('/ask', async (req, res) => {
     }
 
     // Build context
-    const context = laws
-      .map(
-        (law) => `
+    const context = laws.map((law) => `
 SIMILARITY: ${law.similarity}
 
 LAW: ${law.law_name}
@@ -71,11 +108,9 @@ TITLE: ${law.title}
 
 TEXT:
 ${law.text}
-`
-      )
-      .join('\n-------------------------\n');
+`).join('\n-------------------------\n');
 
-    // Ask Groq
+    // Groq call
     const completion = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
       temperature: 0.1,
@@ -86,31 +121,16 @@ ${law.text}
 You are XeerHub, a Somali legal research assistant.
 
 Rules:
-
-1. Use ONLY the legal articles provided in LEGAL CONTEXT.
-2. Prefer the article with the HIGHEST SIMILARITY score.
-3. Do NOT combine unrelated articles.
-4. Always cite:
-   - Law name
-   - Article number
-   - Article title
-5. If not found, respond exactly:
-"I could not find a relevant provision in the available laws."
-6. Never invent legal content.
-7. Quote legal text only when necessary.
-8. Keep answers concise and professional.
-9. Respond in the user's language when possible.
+1. Use ONLY provided legal context
+2. Do not invent laws
+3. Always cite law name, article number, title
+4. Be concise and professional
+5. Respond in user language when possible
           `,
         },
         {
           role: 'user',
-          content: `
-QUESTION:
-${question}
-
-LEGAL CONTEXT:
-${context}
-          `,
+          content: `QUESTION:\n${question}\n\nLEGAL CONTEXT:\n${context}`,
         },
       ],
     });
@@ -128,6 +148,7 @@ ${context}
         similarity: law.similarity,
       })),
     });
+
   } catch (err) {
     console.error('Server Error:', err);
 
@@ -137,14 +158,9 @@ ${context}
   }
 });
 
-// Health check route
-app.get('/', (req, res) => {
-  res.json({
-    status: 'XeerHub API running',
-  });
-});
-
-// Railway-compatible port
+/* ----------------------------
+   START SERVER
+---------------------------- */
 app.listen(PORT, () => {
   console.log(`XeerHub API running on port ${PORT}`);
 });
