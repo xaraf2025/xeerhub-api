@@ -22,19 +22,24 @@ console.log("HF_TOKEN exists =", !!process.env.HF_TOKEN);
 console.log("GROQ_KEY exists =", !!process.env.GROQ_API_KEY);
 
 /* ----------------------------
-   SAFETY CHECK (prevents crash)
+   CLIENTS (SAFE INIT)
 ---------------------------- */
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error("Missing Supabase environment variables");
-}
 
-/* ----------------------------
-   CLIENTS
----------------------------- */
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+let supabase;
+
+function initSupabase() {
+  if (!supabase) {
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      throw new Error("Missing Supabase environment variables");
+    }
+
+    supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY
+    );
+  }
+  return supabase;
+}
 
 const hf = new InferenceClient(process.env.HF_TOKEN);
 
@@ -53,7 +58,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// DEBUG ENV (THIS IS WHAT YOU NEED NOW)
+// DEBUG ENV
 app.get('/debug-env', (req, res) => {
   res.json({
     SUPABASE_URL: process.env.SUPABASE_URL || null,
@@ -80,8 +85,10 @@ app.get('/ask', async (req, res) => {
       inputs: question,
     });
 
-    // Vector search
-    const { data: laws, error } = await supabase.rpc('match_laws', {
+    // SAFE SUPABASE CALL
+    const client = initSupabase();
+
+    const { data: laws, error } = await client.rpc('match_laws', {
       query_embedding: queryEmbedding,
       match_count: 5,
     });
