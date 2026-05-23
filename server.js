@@ -7,7 +7,13 @@ import Groq from 'groq-sdk';
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://xeerhub.com',
+    'https://www.xeerhub.com',
+    'http://localhost:3000',   // for local dev testing
+  ],
+}));
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
