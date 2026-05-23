@@ -4,7 +4,8 @@ import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import { InferenceClient } from '@huggingface/inference';
 import Groq from 'groq-sdk';
-
+console.log("SUPABASE_URL =", process.env.SUPABASE_URL);
+console.log("SUPABASE_KEY exists =", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
 const app = express();
 
 app.use(cors());
