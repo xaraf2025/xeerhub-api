@@ -11,9 +11,10 @@ app.use(cors({
   origin: [
     'https://xeerhub.com',
     'https://www.xeerhub.com',
-    'http://localhost:3000',   // for local dev testing
+    'http://localhost:3000',
   ],
 }));
+
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
@@ -27,7 +28,7 @@ console.log("HF_TOKEN exists =", !!process.env.HF_TOKEN);
 console.log("GROQ_KEY exists =", !!process.env.GROQ_API_KEY);
 
 /* ----------------------------
-   SAFE SUPABASE INIT
+   SUPABASE INIT
 ---------------------------- */
 let supabase;
 
@@ -60,9 +61,7 @@ const groq = new Groq({
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({
-    status: 'XeerHub API running',
-  });
+  res.json({ status: 'XeerHub API running' });
 });
 
 // Debug env
@@ -76,30 +75,32 @@ app.get('/debug-env', (req, res) => {
 });
 
 /* ----------------------------
-   MAIN ASK ROUTE (IMPROVED)
+   MAIN ASK ROUTE (FIXED RAG)
 ---------------------------- */
 app.get('/ask', async (req, res) => {
   try {
     const question = req.query.q;
 
     if (!question) {
-      return res.status(400).json({
-        error: 'Missing question',
-      });
+      return res.status(400).json({ error: 'Missing question' });
     }
 
-    // Embedding
+    /* ----------------------------
+       1. CREATE EMBEDDING
+    ---------------------------- */
     const queryEmbedding = await hf.featureExtraction({
       model: 'sentence-transformers/all-MiniLM-L6-v2',
       inputs: question,
     });
 
-    // Supabase search
     const client = initSupabase();
 
+    /* ----------------------------
+       2. VECTOR SEARCH (EXPANDED)
+    ---------------------------- */
     const { data: laws, error } = await client.rpc('match_laws', {
       query_embedding: queryEmbedding,
-      match_count: 3, // reduced for precision
+      match_count: 8, // increased recall
     });
 
     if (error) {
@@ -114,29 +115,29 @@ app.get('/ask', async (req, res) => {
       });
     }
 
-    // 🧠 Use ONLY best match (critical fix)
-    const bestLaw = laws[0];
+    /* ----------------------------
+       3. TAKE TOP 3 RESULTS
+    ---------------------------- */
+    const topLaws = laws.slice(0, 3);
 
-    // Confidence filter (prevents weak matches)
-    if (bestLaw.similarity < 0.5) {
-      return res.json({
-        answer: "No strong legal match found in the database.",
-        citations: [],
-      });
-    }
+    /* ----------------------------
+       4. BUILD MULTI-LAW CONTEXT
+    ---------------------------- */
+    const context = topLaws.map((law, index) => `
+[LAW ${index + 1}]
+SIMILARITY: ${law.similarity}
 
-    const context = `
-SIMILARITY: ${bestLaw.similarity}
-
-LAW: ${bestLaw.law_name}
-ARTICLE: ${bestLaw.article_number}
-TITLE: ${bestLaw.title}
+LAW: ${law.law_name}
+ARTICLE: ${law.article_number}
+TITLE: ${law.title}
 
 TEXT:
-${bestLaw.text}
-`;
+${law.text}
+`).join("\n\n");
 
-    // Groq response
+    /* ----------------------------
+       5. GROQ RESPONSE
+    ---------------------------- */
     const completion = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
       temperature: 0.1,
@@ -148,11 +149,10 @@ You are XeerHub, a Somali legal research assistant.
 
 Rules:
 1. Use ONLY the provided legal context
-2. Do NOT combine multiple laws
-3. Do NOT invent legal information
-4. Always cite law name, article number, and title
-5. Be concise and legally precise
-6. Respond in the user's language when possible
+2. Do NOT combine unrelated legal rules incorrectly
+3. Always cite law name, article number, and title
+4. Be precise and legally accurate
+5. Do not hallucinate missing legal content
           `,
         },
         {
@@ -166,16 +166,17 @@ Rules:
       completion?.choices?.[0]?.message?.content ||
       'No answer generated.';
 
+    /* ----------------------------
+       6. RESPONSE
+    ---------------------------- */
     return res.json({
       answer,
-      citations: [
-        {
-          law: bestLaw.law_name,
-          article: bestLaw.article_number,
-          title: bestLaw.title,
-          similarity: bestLaw.similarity,
-        },
-      ],
+      citations: topLaws.map(law => ({
+        law: law.law_name,
+        article: law.article_number,
+        title: law.title,
+        similarity: law.similarity,
+      })),
     });
 
   } catch (err) {
