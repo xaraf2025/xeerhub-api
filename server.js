@@ -1,10 +1,20 @@
-
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import Groq from 'groq-sdk';
+const requiredEnv = [
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_ROLE_KEY',
+  'GROQ_API_KEY'
+];
 
+for (const key of requiredEnv) {
+  if (!process.env[key]) {
+    console.error(`Missing ENV: ${key}`);
+    process.exit(1);
+  }
+}
 const app = express();
 
 app.use(cors({
@@ -297,40 +307,3 @@ app.get('/ask', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`XeerHub API running on port ${PORT}`);
 });
-```
-
-# Required Supabase SQL Optimization
-
-Run this in Supabase SQL Editor:
-
-```sql
-ALTER TABLE laws
-ADD COLUMN IF NOT EXISTS text_search tsvector
-GENERATED ALWAYS AS (
-  to_tsvector(
-    'english',
-    coalesce(title,'') || ' ' || coalesce(text,'')
-  )
-) STORED;
-
-CREATE INDEX IF NOT EXISTS laws_text_search_idx
-ON laws
-USING GIN(text_search);
-```
-
-# Remove These Environment Variables
-
-You no longer need:
-
-```env
-HF_API_TOKEN=
-```
-
-# Expected Improvements
-
-* Much faster responses
-* Reduced Railway cold-start impact
-* Lower Groq latency
-* More stable streaming
-* Better legal precision
-* Lower infrastructure complexity
