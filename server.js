@@ -44,7 +44,7 @@ const groq = new Groq({
 const cache = new Map();
 
 /* ─────────────────────────────────────────────
-   STOP WORDS — excluded from search terms
+   STOP WORDS
 ───────────────────────────────────────────── */
 const STOP = new Set([
   'who','what','when','where','which','how','does','can','the',
@@ -53,18 +53,30 @@ const STOP = new Set([
   'under','after','only','both','each','than','then','been',
   'made','make','same','most','other','may','is','a','an',
   'in','of','to','do','did','has','had','him','his','her',
-  'they','them','our','your','my','we','us','me','he','she',
-  'define','defined','definition','meaning','mean','means',
-  'tell','explain','describe','about','give','get','find'
+  'they','them','our','your','my','we','us','me','he','she'
 ]);
 
+const DEFINITION_TRIGGERS = [
+  'who is','what is','define','definition','meaning of','defined as',
+  'what does','what are','explain','describe','counts as','qualifies as',
+  'considered','constitute','mean'
+];
+
+function extractSubject(question) {
+  let q = question.toLowerCase().trim();
+  for (const trigger of DEFINITION_TRIGGERS) {
+    q = q.replace(trigger, ' ').trim();
+  }
+  return q.replace(/\b(a|an|the|in|of|under|somali|law)\b/g, ' ')
+          .replace(/\s+/g, ' ').trim();
+}
+
 /* ─────────────────────────────────────────────
-   SMART TEXT SEARCH
-   1. Try AND search on key terms (most precise)
-   2. Fall back to websearch if no results
-   3. Fall back to OR search as last resort
+   RETRIEVE — definition-aware, 3-tier search
 ───────────────────────────────────────────── */
-async function textSearch(question) {
+async function retrieve(question) {
+  const q = question.toLowerCase();
+  const isDefinition = DEFINITION_TRIGGERS.some(t => q.includes(t));
 
   const words = question
     .toLowerCase()
@@ -72,52 +84,59 @@ async function textSearch(question) {
     .split(/\s+/)
     .filter(w => w.length > 2 && !STOP.has(w));
 
-  // No meaningful words — return empty
-  if (!words.length) return { laws: [], method: 'text' };
+  if (!words.length) return { laws: [], method: 'empty' };
 
-  // 1. AND search — all key terms must appear (most precise)
+  // STEP 1: For definition questions — search by title first
+  if (isDefinition) {
+    const subject = extractSubject(question);
+    const subjectWords = subject.split(/\s+/).filter(w => w.length > 2);
+
+    if (subjectWords.length > 0) {
+      // Direct title match via ilike
+      const { data: titleData } = await supabase
+        .from('laws')
+        .select('law_name, article_number, title, text')
+        .ilike('title', `%${subjectWords.join('%')}%`)
+        .limit(3);
+
+      if (titleData?.length) {
+        console.log(`Title search "${subject}" → ${titleData.length} results`);
+        return { laws: titleData, method: 'title' };
+      }
+    }
+  }
+
+  // STEP 2: AND search — all key terms must appear
   const andQuery = words.slice(0, 5).join(' & ');
-  let { data } = await supabase
+  const { data: andData } = await supabase
     .from('laws')
     .select('law_name, article_number, title, text')
     .textSearch('text_search', andQuery, { type: 'plain', config: 'english' })
     .limit(5);
 
-  if (data?.length) {
-    console.log(`AND search "${andQuery}" → ${data.length} results`);
-    return { laws: data, method: 'text-and' };
+  if (andData?.length) {
+    // Boost Definitions/General Provisions articles to top for definition questions
+    if (isDefinition) {
+      andData.sort((a, b) => {
+        const aScore = /definition|general provision/i.test(a.title) ? -1 : 0;
+        const bScore = /definition|general provision/i.test(b.title) ? -1 : 0;
+        return aScore - bScore;
+      });
+    }
+    console.log(`AND search "${andQuery}" → ${andData.length} results`);
+    return { laws: andData, method: 'text-and' };
   }
 
-  // 2. Websearch — handles phrases naturally
-  const wsQuery = words.slice(0, 5).join(' ');
-  const ws = await supabase
-    .from('laws')
-    .select('law_name, article_number, title, text')
-    .textSearch('text_search', wsQuery, { type: 'websearch', config: 'english' })
-    .limit(5);
-
-  if (ws.data?.length) {
-    console.log(`Websearch "${wsQuery}" → ${ws.data.length} results`);
-    return { laws: ws.data, method: 'text-web' };
-  }
-
-  // 3. OR search — broadest fallback (least precise)
+  // STEP 3: OR search — broadest fallback
   const orQuery = words.slice(0, 4).join(' | ');
-  const or = await supabase
+  const { data: orData } = await supabase
     .from('laws')
     .select('law_name, article_number, title, text')
     .textSearch('text_search', orQuery, { type: 'plain', config: 'english' })
     .limit(5);
 
-  console.log(`OR search "${orQuery}" → ${or.data?.length || 0} results`);
-  return { laws: or.data || [], method: 'text-or' };
-}
-
-/* ─────────────────────────────────────────────
-   RETRIEVE
-───────────────────────────────────────────── */
-async function retrieve(question) {
-  return textSearch(question);
+  console.log(`OR search "${orQuery}" → ${orData?.length || 0} results`);
+  return { laws: orData || [], method: 'text-or' };
 }
 
 /* ─────────────────────────────────────────────
