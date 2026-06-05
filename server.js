@@ -44,114 +44,70 @@ const groq = new Groq({
 const cache = new Map();
 
 /* ─────────────────────────────────────────────
-   STOP WORDS
+   FAST TEXT SEARCH ONLY
 ───────────────────────────────────────────── */
-const STOP = new Set([
-  'who','what','when','where','which','how','does','can','the',
-  'and','for','are','that','this','with','have','from','will',
-  'not','but','any','all','was','were','its','their','there',
-  'under','after','only','both','each','than','then','been',
-  'made','make','same','most','other','may','is','a','an',
-  'in','of','to','do','did','has','had','him','his','her',
-  'they','them','our','your','my','we','us','me','he','she'
-]);
+async function textSearch(question) {
 
-const DEFINITION_TRIGGERS = [
-  'who is','what is','define','definition','meaning of','defined as',
-  'what does','what are','explain','describe','counts as','qualifies as',
-  'considered','constitute','mean'
-];
-
-function extractSubject(question) {
-  let q = question.toLowerCase().trim();
-  for (const trigger of DEFINITION_TRIGGERS) {
-    q = q.replace(trigger, ' ').trim();
-  }
-  return q.replace(/\b(a|an|the|in|of|under|somali|law)\b/g, ' ')
-          .replace(/\s+/g, ' ').trim();
-}
-
-/* ─────────────────────────────────────────────
-   RETRIEVE — definition-aware, 3-tier search
-───────────────────────────────────────────── */
-async function retrieve(question) {
-  const q = question.toLowerCase();
-  const isDefinition = DEFINITION_TRIGGERS.some(t => q.includes(t));
-
-  const words = question
+  const terms = question
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
-    .filter(w => w.length > 2 && !STOP.has(w));
+    .filter(w => w.length > 2)
+    .slice(0, 6)
+    .join(' | ');
 
-  if (!words.length) return { laws: [], method: 'empty' };
+  const [lawRes, blogRes] = await Promise.all([
+    supabase
+      .from('laws')
+      .select('law_name, article_number, title, text')
+      .textSearch('text_search', terms, { type: 'plain', config: 'english' })
+      .limit(3),
+    supabase
+      .from('blogs')
+      .select('slug, title, body')
+      .textSearch('text_search', terms, { type: 'plain', config: 'english' })
+      .limit(2),
+  ]);
 
-  // STEP 1: For definition questions — search by title first
-  if (isDefinition) {
-    const subject = extractSubject(question);
-    const subjectWords = subject.split(/\s+/).filter(w => w.length > 2);
+  return {
+    laws:  lawRes.data  || [],
+    blogs: blogRes.data || [],
+    method: 'text',
+  };
+}
 
-    if (subjectWords.length > 0) {
-      // Direct title match via ilike
-      const { data: titleData } = await supabase
-        .from('laws')
-        .select('law_name, article_number, title, text')
-        .ilike('title', `%${subjectWords.join('%')}%`)
-        .limit(3);
-
-      if (titleData?.length) {
-        console.log(`Title search "${subject}" → ${titleData.length} results`);
-        return { laws: titleData, method: 'title' };
-      }
-    }
-  }
-
-  // STEP 2: AND search — all key terms must appear
-  const andQuery = words.slice(0, 5).join(' & ');
-  const { data: andData } = await supabase
-    .from('laws')
-    .select('law_name, article_number, title, text')
-    .textSearch('text_search', andQuery, { type: 'plain', config: 'english' })
-    .limit(5);
-
-  if (andData?.length) {
-    // Boost Definitions/General Provisions articles to top for definition questions
-    if (isDefinition) {
-      andData.sort((a, b) => {
-        const aScore = /definition|general provision/i.test(a.title) ? -1 : 0;
-        const bScore = /definition|general provision/i.test(b.title) ? -1 : 0;
-        return aScore - bScore;
-      });
-    }
-    console.log(`AND search "${andQuery}" → ${andData.length} results`);
-    return { laws: andData, method: 'text-and' };
-  }
-
-  // STEP 3: OR search — broadest fallback
-  const orQuery = words.slice(0, 4).join(' | ');
-  const { data: orData } = await supabase
-    .from('laws')
-    .select('law_name, article_number, title, text')
-    .textSearch('text_search', orQuery, { type: 'plain', config: 'english' })
-    .limit(5);
-
-  console.log(`OR search "${orQuery}" → ${orData?.length || 0} results`);
-  return { laws: orData || [], method: 'text-or' };
+/* ─────────────────────────────────────────────
+   RETRIEVE
+───────────────────────────────────────────── */
+async function retrieve(question) {
+  return textSearch(question);
 }
 
 /* ─────────────────────────────────────────────
    CONTEXT BUILDER
 ───────────────────────────────────────────── */
-function buildContext({ laws }) {
+function buildContext({ laws, blogs = [] }) {
 
-  return [
-    '==================== LAWS ====================',
+  const parts = ['==================== LAWS ===================='];
 
+  parts.push(
     laws.map((l, i) =>
-      `[LAW ${i + 1}]\nLaw: ${l.law_name}\nArticle: ${l.article_number}\nTitle: ${l.title || ''}\nText: ${(l.text || '').slice(0, 1200)}`
+      `[LAW ${i + 1}]\nLaw: ${l.law_name}\nArticle: ${l.article_number}\nTitle: ${l.title}\nText: ${l.text.slice(0, 1200)}`
     ).join('\n\n')
+  );
 
-  ].join('\n');
+  if (blogs.length) {
+    parts.push('==================== BLOG ARTICLES ====================');
+    parts.push(
+      blogs.map((b, i) => {
+        // strip HTML tags for LLM context
+        const plain = b.body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, 800);
+        return `[BLOG ${i + 1}]\nSlug: ${b.slug}\nTitle: ${b.title}\nExcerpt: ${plain}`;
+      }).join('\n\n')
+    );
+  }
+
+  return parts.join('\n');
 }
 
 /* ─────────────────────────────────────────────
@@ -170,7 +126,7 @@ RULES:
 /* ─────────────────────────────────────────────
    CITATIONS
 ───────────────────────────────────────────── */
-function citationsFrom({ laws }) {
+function citationsFrom({ laws, blogs = [] }) {
   return {
     laws: laws.map(l => ({
       type: 'law',
@@ -179,7 +135,11 @@ function citationsFrom({ laws }) {
       title: l.title,
       similarity: l.similarity,
     })),
-    blogs: [],
+    blogs: blogs.map(b => ({
+      type: 'blog',
+      slug: b.slug,
+      title: b.title,
+    })),
   };
 }
 
@@ -242,9 +202,9 @@ app.get('/ask', async (req, res) => {
 
       const retrieved = await retrieve(question);
 
-      const { laws } = retrieved;
+      const { laws, blogs = [] } = retrieved;
 
-      send('citations', citationsFrom({ laws }));
+      send('citations', citationsFrom({ laws, blogs }));
 
       if (!laws.length) {
 
@@ -271,7 +231,7 @@ app.get('/ask', async (req, res) => {
           },
           {
             role: 'user',
-            content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}`
+            content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws, blogs })}`
           }
         ]
       });
@@ -315,7 +275,7 @@ app.get('/ask', async (req, res) => {
   ══════════════════════════════════════════ */
   try {
 
-    const { laws } = await retrieve(question);
+    const { laws, blogs = [] } = await retrieve(question);
 
     if (!laws.length) {
       return res.json({
@@ -338,14 +298,14 @@ app.get('/ask', async (req, res) => {
         },
         {
           role: 'user',
-          content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}`
+          content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws, blogs })}`
         }
       ]
     });
 
     const responseData = {
       answer: completion?.choices?.[0]?.message?.content?.trim() || 'No answer generated.',
-      citations: citationsFrom({ laws }),
+      citations: citationsFrom({ laws, blogs }),
     };
 
     cache.set(question, responseData);
@@ -360,6 +320,31 @@ app.get('/ask', async (req, res) => {
       error: err.message || 'Internal server error'
     });
   }
+});
+
+/* ─────────────────────────────────────────────
+   BLOG ROUTES
+───────────────────────────────────────────── */
+
+// GET /blogs — list all articles (no body, just metadata)
+app.get('/blogs', async (req, res) => {
+  const { data, error } = await supabase
+    .from('blogs')
+    .select('id, slug, title, category, date_label, read_time, created_at')
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// GET /blogs/:slug — single article with full body
+app.get('/blogs/:slug', async (req, res) => {
+  const { data, error } = await supabase
+    .from('blogs')
+    .select('*')
+    .eq('slug', req.params.slug)
+    .single();
+  if (error || !data) return res.status(404).json({ error: 'Article not found' });
+  res.json(data);
 });
 
 /* ─────────────────────────────────────────────
