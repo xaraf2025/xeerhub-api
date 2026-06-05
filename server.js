@@ -148,7 +148,7 @@ function buildContext({ laws }) {
     '==================== LAWS ====================',
 
     laws.map((l, i) =>
-      `[LAW ${i + 1}]\nLaw: ${l.law_name}\nArticle: ${l.article_number}\nTitle: ${l.title}\nText: ${l.text.slice(0, 1200)}`
+      `[LAW ${i + 1}]\nLaw: ${l.law_name}\nArticle: ${l.article_number}\nTitle: ${l.title || ''}\nText: ${(l.text || '').slice(0, 1200)}`
     ).join('\n\n')
 
   ].join('\n');
