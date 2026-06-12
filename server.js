@@ -53,26 +53,57 @@ async function textSearch(question) {
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(w => w.length > 2)
-    .slice(0, 6)
-    .join(' | ');
+    .slice(0, 6);
 
-  const [lawRes, blogRes] = await Promise.all([
-    supabase
-      .from('laws')
-      .select('law_name, article_number, title, text')
-      .textSearch('text_search', terms, { type: 'plain', config: 'english' })
-      .limit(3),
-    supabase
-      .from('blogs')
-      .select('slug, title, body')
-      .textSearch('text_search', terms, { type: 'plain', config: 'english' })
-      .limit(2),
-  ]);
+  if (!terms.length) {
+    return { laws: [], method: 'none' };
+  }
+
+  const query = terms.join(' ');
+
+  // Tier 1: title match on first keyword
+  let { data, error } = await supabase
+    .from('laws')
+    .select('law_name, article_number, title, text')
+    .ilike('title', `%${terms[0]}%`)
+    .limit(3);
+
+  if (error) console.error('Title search error:', error.message);
+
+  if (data?.length) {
+    return { laws: data, method: 'title' };
+  }
+
+  // Tier 2: full text search (websearch handles multi-word queries correctly)
+  ({ data, error } = await supabase
+    .from('laws')
+    .select('law_name, article_number, title, text')
+    .textSearch('text_search', query, {
+      type: 'websearch',
+      config: 'english'
+    })
+    .limit(3));
+
+  if (error) console.error('Text search error:', error.message);
+
+  if (data?.length) {
+    return { laws: data, method: 'text' };
+  }
+
+  // Tier 3: OR fallback - match any single keyword via ILIKE on text
+  const orFilter = terms.map(t => `text.ilike.%${t}%`).join(',');
+
+  ({ data, error } = await supabase
+    .from('laws')
+    .select('law_name, article_number, title, text')
+    .or(orFilter)
+    .limit(3));
+
+  if (error) console.error('Fallback search error:', error.message);
 
   return {
-    laws:  lawRes.data  || [],
-    blogs: blogRes.data || [],
-    method: 'text',
+    laws: data || [],
+    method: 'fallback',
   };
 }
 
@@ -86,28 +117,16 @@ async function retrieve(question) {
 /* ─────────────────────────────────────────────
    CONTEXT BUILDER
 ───────────────────────────────────────────── */
-function buildContext({ laws, blogs = [] }) {
+function buildContext({ laws }) {
 
-  const parts = ['==================== LAWS ===================='];
+  return [
+    '==================== LAWS ====================',
 
-  parts.push(
     laws.map((l, i) =>
       `[LAW ${i + 1}]\nLaw: ${l.law_name}\nArticle: ${l.article_number}\nTitle: ${l.title}\nText: ${l.text.slice(0, 1200)}`
     ).join('\n\n')
-  );
 
-  if (blogs.length) {
-    parts.push('==================== BLOG ARTICLES ====================');
-    parts.push(
-      blogs.map((b, i) => {
-        // strip HTML tags for LLM context
-        const plain = b.body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, 800);
-        return `[BLOG ${i + 1}]\nSlug: ${b.slug}\nTitle: ${b.title}\nExcerpt: ${plain}`;
-      }).join('\n\n')
-    );
-  }
-
-  return parts.join('\n');
+  ].join('\n');
 }
 
 /* ─────────────────────────────────────────────
@@ -126,7 +145,7 @@ RULES:
 /* ─────────────────────────────────────────────
    CITATIONS
 ───────────────────────────────────────────── */
-function citationsFrom({ laws, blogs = [] }) {
+function citationsFrom({ laws }) {
   return {
     laws: laws.map(l => ({
       type: 'law',
@@ -135,11 +154,7 @@ function citationsFrom({ laws, blogs = [] }) {
       title: l.title,
       similarity: l.similarity,
     })),
-    blogs: blogs.map(b => ({
-      type: 'blog',
-      slug: b.slug,
-      title: b.title,
-    })),
+    blogs: [],
   };
 }
 
@@ -202,9 +217,9 @@ app.get('/ask', async (req, res) => {
 
       const retrieved = await retrieve(question);
 
-      const { laws, blogs = [] } = retrieved;
+      const { laws } = retrieved;
 
-      send('citations', citationsFrom({ laws, blogs }));
+      send('citations', citationsFrom({ laws }));
 
       if (!laws.length) {
 
@@ -231,7 +246,7 @@ app.get('/ask', async (req, res) => {
           },
           {
             role: 'user',
-            content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws, blogs })}`
+            content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}`
           }
         ]
       });
@@ -275,7 +290,7 @@ app.get('/ask', async (req, res) => {
   ══════════════════════════════════════════ */
   try {
 
-    const { laws, blogs = [] } = await retrieve(question);
+    const { laws } = await retrieve(question);
 
     if (!laws.length) {
       return res.json({
@@ -298,14 +313,14 @@ app.get('/ask', async (req, res) => {
         },
         {
           role: 'user',
-          content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws, blogs })}`
+          content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}`
         }
       ]
     });
 
     const responseData = {
       answer: completion?.choices?.[0]?.message?.content?.trim() || 'No answer generated.',
-      citations: citationsFrom({ laws, blogs }),
+      citations: citationsFrom({ laws }),
     };
 
     cache.set(question, responseData);
@@ -320,31 +335,6 @@ app.get('/ask', async (req, res) => {
       error: err.message || 'Internal server error'
     });
   }
-});
-
-/* ─────────────────────────────────────────────
-   BLOG ROUTES
-───────────────────────────────────────────── */
-
-// GET /blogs — list all articles (no body, just metadata)
-app.get('/blogs', async (req, res) => {
-  const { data, error } = await supabase
-    .from('blogs')
-    .select('id, slug, title, category, date_label, read_time, created_at')
-    .order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
-});
-
-// GET /blogs/:slug — single article with full body
-app.get('/blogs/:slug', async (req, res) => {
-  const { data, error } = await supabase
-    .from('blogs')
-    .select('*')
-    .eq('slug', req.params.slug)
-    .single();
-  if (error || !data) return res.status(404).json({ error: 'Article not found' });
-  res.json(data);
 });
 
 /* ─────────────────────────────────────────────
