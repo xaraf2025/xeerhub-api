@@ -44,74 +44,74 @@ const groq = new Groq({
 const cache = new Map();
 
 /* ─────────────────────────────────────────────
-   FAST TEXT SEARCH ONLY
+   LAW NAME MAP
+   Maps the ?law= query param sent by the frontend
+   to the exact law_name values stored in Supabase.
 ───────────────────────────────────────────── */
-async function textSearch(question) {
+const LAW_NAME_MAP = {
+  'Labor Law':              'Somalia Labour Code',
+  'Foreign Investment Law': 'Foreign Investment Law',
+  'Income Tax Law':         'Income Tax Act 2025',
+  'Environmental Law':      'Environmental Protection and Management Act 2024',
+  'Data Protection Law':    'Data Protection Act',
+};
 
-  const terms = question
+/* ─────────────────────────────────────────────
+   FAST TEXT SEARCH
+   - Uses AND (plain) search so all key terms must
+     match, avoiding false positives from loose OR.
+   - Filters by law_name when a specific law is
+     provided, so "fire without notice" never
+     surfaces Foreign Investment Law articles.
+   - Falls back to broader OR search if AND yields
+     no results (handles short / sparse queries).
+───────────────────────────────────────────── */
+async function textSearch(question, lawArea) {
+
+  const words = question
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(w => w.length > 2)
     .slice(0, 6);
 
-  if (!terms.length) {
-    return { laws: [], method: 'none' };
+  const andTerms = words.join(' & ');
+  const orTerms  = words.join(' | ');
+
+  // Resolve law_name filter (null = search all laws)
+  const lawName = LAW_NAME_MAP[lawArea] || null;
+
+  async function runSearch(terms) {
+    let q = supabase
+      .from('laws')
+      .select('law_name, article_number, title, text')
+      .textSearch('text_search', terms, { type: 'plain', config: 'english' })
+      .limit(3);
+
+    if (lawName) q = q.eq('law_name', lawName);
+
+    return q;
   }
 
-  const query = terms.join(' ');
+  // Primary: AND search (all terms must match)
+  let res = await runSearch(andTerms);
 
-  // Tier 1: title match on first keyword
-  let { data, error } = await supabase
-    .from('laws')
-    .select('law_name, article_number, title, text')
-    .ilike('title', `%${terms[0]}%`)
-    .limit(3);
-
-  if (error) console.error('Title search error:', error.message);
-
-  if (data?.length) {
-    return { laws: data, method: 'title' };
+  // Fallback: OR search if AND returns nothing
+  if (!res.data || res.data.length === 0) {
+    res = await runSearch(orTerms);
   }
-
-  // Tier 2: full text search (websearch handles multi-word queries correctly)
-  ({ data, error } = await supabase
-    .from('laws')
-    .select('law_name, article_number, title, text')
-    .textSearch('text_search', query, {
-      type: 'websearch',
-      config: 'english'
-    })
-    .limit(3));
-
-  if (error) console.error('Text search error:', error.message);
-
-  if (data?.length) {
-    return { laws: data, method: 'text' };
-  }
-
-  // Tier 3: OR fallback - match any single keyword via ILIKE on text
-  const orFilter = terms.map(t => `text.ilike.%${t}%`).join(',');
-
-  ({ data, error } = await supabase
-    .from('laws')
-    .select('law_name, article_number, title, text')
-    .or(orFilter)
-    .limit(3));
-
-  if (error) console.error('Fallback search error:', error.message);
 
   return {
-    laws: data || [],
-    method: 'fallback',
+    laws: res.data || [],
+    method: 'text',
   };
 }
 
 /* ─────────────────────────────────────────────
    RETRIEVE
 ───────────────────────────────────────────── */
-async function retrieve(question) {
-  return textSearch(question);
+async function retrieve(question, lawArea) {
+  return textSearch(question, lawArea);
 }
 
 /* ─────────────────────────────────────────────
@@ -144,13 +144,21 @@ RULES:
 
 /* ─────────────────────────────────────────────
    CITATIONS
+   Strip any leading "Art. " / "art. " from
+   article_number — the frontend template already
+   prepends "Art. " so we must not duplicate it.
 ───────────────────────────────────────────── */
+function cleanArticleNumber(raw) {
+  if (!raw) return raw;
+  return raw.replace(/^art\.?\s*/i, '').trim();
+}
+
 function citationsFrom({ laws }) {
   return {
     laws: laws.map(l => ({
       type: 'law',
       law: l.law_name,
-      article: l.article_number,
+      article: cleanArticleNumber(l.article_number),
       title: l.title,
       similarity: l.similarity,
     })),
@@ -181,6 +189,7 @@ app.get('/ask', async (req, res) => {
   }
 
   const question = req.query.q?.trim();
+  const lawArea  = req.query.law?.trim() || 'General';
 
   if (!question) {
     return res.status(400).json({
@@ -188,9 +197,12 @@ app.get('/ask', async (req, res) => {
     });
   }
 
+  // Cache key includes lawArea so different law filters don't share cached results
+  const cacheKey = `${lawArea}::${question}`;
+
   // Cache hit
-  if (cache.has(question)) {
-    return res.json(cache.get(question));
+  if (cache.has(cacheKey)) {
+    return res.json(cache.get(cacheKey));
   }
 
   /* ══════════════════════════════════════════
@@ -215,7 +227,7 @@ app.get('/ask', async (req, res) => {
         msg: 'Searching Somali laws...'
       });
 
-      const retrieved = await retrieve(question);
+      const retrieved = await retrieve(question, lawArea);
 
       const { laws } = retrieved;
 
@@ -290,7 +302,7 @@ app.get('/ask', async (req, res) => {
   ══════════════════════════════════════════ */
   try {
 
-    const { laws } = await retrieve(question);
+    const { laws } = await retrieve(question, lawArea);
 
     if (!laws.length) {
       return res.json({
@@ -323,7 +335,7 @@ app.get('/ask', async (req, res) => {
       citations: citationsFrom({ laws }),
     };
 
-    cache.set(question, responseData);
+    cache.set(cacheKey, responseData);
 
     return res.json(responseData);
 
