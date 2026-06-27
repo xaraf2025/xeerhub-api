@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import Groq from 'groq-sdk';
+
 const requiredEnv = [
   'SUPABASE_URL',
   'SUPABASE_SERVICE_ROLE_KEY',
@@ -15,6 +16,7 @@ for (const key of requiredEnv) {
     process.exit(1);
   }
 }
+
 const app = express();
 
 app.use(cors({
@@ -39,9 +41,35 @@ const groq = new Groq({
 });
 
 /* ─────────────────────────────────────────────
-   SIMPLE MEMORY CACHE
+   CACHE WITH TTL
+   FIX: Previously Map() with no expiry — entries
+   accumulated indefinitely. Now each entry stores
+   a timestamp and expires after 24 hours.
 ───────────────────────────────────────────── */
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
 const cache = new Map();
+
+function cacheGet(key) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CACHE_TTL_MS) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function cacheSet(key, data) {
+  cache.set(key, { data, ts: Date.now() });
+  // Evict entries older than TTL to prevent unbounded growth
+  if (cache.size > 500) {
+    const now = Date.now();
+    for (const [k, v] of cache.entries()) {
+      if (now - v.ts > CACHE_TTL_MS) cache.delete(k);
+    }
+  }
+}
 
 /* ─────────────────────────────────────────────
    LAW NAME MAP
@@ -57,54 +85,120 @@ const LAW_NAME_MAP = {
 };
 
 /* ─────────────────────────────────────────────
-   FAST TEXT SEARCH
-   - Uses AND (plain) search so all key terms must
-     match, avoiding false positives from loose OR.
-   - Filters by law_name when a specific law is
-     provided, so "fire without notice" never
-     surfaces Foreign Investment Law articles.
-   - Falls back to broader OR search if AND yields
-     no results (handles short / sparse queries).
+   STOP WORDS — excluded from search tokens
 ───────────────────────────────────────────── */
-async function textSearch(question, lawArea) {
+const STOP_WORDS = new Set([
+  'what','when','where','which','who','how','does','can','the','and',
+  'for','are','that','this','with','have','from','will','been','they',
+  'also','into','its','not','but','any','all','more','must','their',
+  'your','there','under','after','only','both','each','such','some',
+  'than','then','made','make','same','most','other','may','somalia',
+  'somali','law','legal','act','code'
+]);
 
-  const words = question
+function tokenise(text) {
+  return text
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
-    .filter(w => w.length > 2)
-    .slice(0, 6);
+    .filter(w => w.length > 2 && !STOP_WORDS.has(w))
+    .slice(0, 8);
+}
 
-  const andTerms = words.join(' & ');
-  const orTerms  = words.join(' | ');
+/* ─────────────────────────────────────────────
+   FAST TEXT SEARCH
+   FIX: Previous version fell back from AND to OR
+   search without law-area filtering when law='General',
+   allowing cross-law article contamination.
+
+   New strategy (3 tiers, law filter preserved throughout):
+   1. AND full-text search (all tokens must match)
+   2. ILIKE search on text column (partial keyword match)
+   3. OR full-text search (at least one token matches)
+      — but ONLY if a specific law is selected, preventing
+        irrelevant cross-law results in General mode.
+   If all tiers fail in General mode, return empty rather
+   than contaminating the answer with unrelated law areas.
+───────────────────────────────────────────── */
+async function textSearch(question, lawArea) {
+
+  const tokens = tokenise(question);
+
+  if (!tokens.length) {
+    return { laws: [], method: 'none' };
+  }
+
+  const andTerms = tokens.join(' & ');
+  const orTerms  = tokens.join(' | ');
 
   // Resolve law_name filter (null = search all laws)
   const lawName = LAW_NAME_MAP[lawArea] || null;
+  const isGeneral = !lawName;
 
-  async function runSearch(terms) {
+  // ── Tier 1: AND full-text search ──────────────────────
+  async function andSearch() {
     let q = supabase
       .from('laws')
       .select('law_name, article_number, title, text')
-      .textSearch('text_search', terms, { type: 'plain', config: 'english' })
-      .limit(3);
-
+      .textSearch('text_search', andTerms, { type: 'plain', config: 'english' })
+      .limit(4);
     if (lawName) q = q.eq('law_name', lawName);
-
-    return q;
+    const { data, error } = await q;
+    if (error) console.error('AND search error:', error.message);
+    return data || [];
   }
 
-  // Primary: AND search (all terms must match)
-  let res = await runSearch(andTerms);
+  // ── Tier 2: ILIKE keyword search ──────────────────────
+  // Searches the text column for any meaningful token.
+  // Keeps law filter active so General mode still works safely.
+  async function ilikeSearch() {
+    // Use the two most distinctive tokens (longest words)
+    const sorted = [...tokens].sort((a, b) => b.length - a.length);
+    const primary = sorted[0];
+    if (!primary) return [];
 
-  // Fallback: OR search if AND returns nothing
-  if (!res.data || res.data.length === 0) {
-    res = await runSearch(orTerms);
+    let q = supabase
+      .from('laws')
+      .select('law_name, article_number, title, text')
+      .ilike('text', `%${primary}%`)
+      .limit(4);
+    if (lawName) q = q.eq('law_name', lawName);
+    const { data, error } = await q;
+    if (error) console.error('ILIKE search error:', error.message);
+    return data || [];
   }
 
-  return {
-    laws: res.data || [],
-    method: 'text',
-  };
+  // ── Tier 3: OR full-text search ───────────────────────
+  // ONLY used when a specific law is selected.
+  // Skipped in General mode to prevent cross-law contamination.
+  async function orSearch() {
+    if (isGeneral) return []; // ← key fix
+    let q = supabase
+      .from('laws')
+      .select('law_name, article_number, title, text')
+      .textSearch('text_search', orTerms, { type: 'plain', config: 'english' })
+      .limit(4);
+    if (lawName) q = q.eq('law_name', lawName);
+    const { data, error } = await q;
+    if (error) console.error('OR search error:', error.message);
+    return data || [];
+  }
+
+  // Run tiers in sequence, stop at first hit
+  let results = await andSearch();
+  let method = 'and';
+
+  if (!results.length) {
+    results = await ilikeSearch();
+    method = 'ilike';
+  }
+
+  if (!results.length) {
+    results = await orSearch();
+    method = 'or';
+  }
+
+  return { laws: results, method };
 }
 
 /* ─────────────────────────────────────────────
@@ -118,14 +212,11 @@ async function retrieve(question, lawArea) {
    CONTEXT BUILDER
 ───────────────────────────────────────────── */
 function buildContext({ laws }) {
-
   return [
     '==================== LAWS ====================',
-
     laws.map((l, i) =>
       `[LAW ${i + 1}]\nLaw: ${l.law_name}\nArticle: ${l.article_number}\nTitle: ${l.title}\nText: ${l.text.slice(0, 1200)}`
     ).join('\n\n')
-
   ].join('\n');
 }
 
@@ -136,17 +227,15 @@ const SYSTEM = `You are XeerHub, a Somali legal intelligence assistant.
 
 RULES:
 - Use ONLY the provided laws.
-- Never invent facts.
+- Never invent facts or article numbers.
 - Always cite law name and article number.
 - Be concise, structured, and accurate.
 - If context is insufficient, say so clearly.
-- Write in plain English for lawyers, NGOs, and business professionals.`;
+- Write in plain English for lawyers, NGOs, and business professionals.
+- End every answer with: "For your specific situation, consult a qualified Somali lawyer."`;
 
 /* ─────────────────────────────────────────────
    CITATIONS
-   Strip any leading "Art. " / "art. " from
-   article_number — the frontend template already
-   prepends "Art. " so we must not duplicate it.
 ───────────────────────────────────────────── */
 function cleanArticleNumber(raw) {
   if (!raw) return raw;
@@ -167,11 +256,13 @@ function citationsFrom({ laws }) {
 }
 
 /* ─────────────────────────────────────────────
-   ROOT
+   ROOT / HEALTH CHECK
 ───────────────────────────────────────────── */
 app.get('/', (req, res) => {
   res.json({
-    status: 'XeerHub API running'
+    status: 'XeerHub API running',
+    cache_entries: cache.size,
+    uptime_seconds: Math.round(process.uptime()),
   });
 });
 
@@ -180,29 +271,25 @@ app.get('/', (req, res) => {
 ───────────────────────────────────────────── */
 app.get('/ask', async (req, res) => {
 
-  // Warmup
+  // Warmup ping — used by frontend to keep Railway hot
   if (req.query.warmup === '1') {
-    return res.json({
-      status: 'warm',
-      ok: true
-    });
+    return res.json({ status: 'warm', ok: true, ts: Date.now() });
   }
 
   const question = req.query.q?.trim();
   const lawArea  = req.query.law?.trim() || 'General';
 
   if (!question) {
-    return res.status(400).json({
-      error: 'Missing question'
-    });
+    return res.status(400).json({ error: 'Missing question' });
   }
 
-  // Cache key includes lawArea so different law filters don't share cached results
+  // Cache key includes lawArea so different law filters never share results
   const cacheKey = `${lawArea}::${question}`;
 
-  // Cache hit
-  if (cache.has(cacheKey)) {
-    return res.json(cache.get(cacheKey));
+  // Cache hit (with TTL check)
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    return res.json({ ...cached, cached: true });
   }
 
   /* ══════════════════════════════════════════
@@ -223,28 +310,21 @@ app.get('/ask', async (req, res) => {
 
     try {
 
-      send('status', {
-        msg: 'Searching Somali laws...'
-      });
+      send('status', { msg: 'Searching Somali laws...' });
 
       const retrieved = await retrieve(question, lawArea);
-
       const { laws } = retrieved;
 
       send('citations', citationsFrom({ laws }));
 
       if (!laws.length) {
-
         send('answer_done', {
-          answer: "I couldn't find relevant legal content for that question in XeerHub's database. Try rephrasing your question."
+          answer: "I couldn't find relevant legal content for that question in XeerHub's verified database. Try selecting a specific law area, or browse the Q&A library for related entries."
         });
-
         return res.end();
       }
 
-      send('status', {
-        msg: 'Preparing answer...'
-      });
+      send('status', { msg: 'Composing answer...' });
 
       const stream = await groq.chat.completions.create({
         model: 'llama-3.1-8b-instant',
@@ -252,44 +332,28 @@ app.get('/ask', async (req, res) => {
         max_tokens: 400,
         stream: true,
         messages: [
-          {
-            role: 'system',
-            content: SYSTEM
-          },
-          {
-            role: 'user',
-            content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}`
-          }
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}` }
         ]
       });
 
       let full = '';
 
       for await (const chunk of stream) {
-
         const token = chunk.choices[0]?.delta?.content || '';
-
         if (token) {
           full += token;
           send('token', { token });
         }
       }
 
-      send('answer_done', {
-        answer: full
-      });
-
+      send('answer_done', { answer: full });
       res.end();
 
     } catch (err) {
-
       console.error('Stream error:', err);
-
       try {
-        send('error', {
-          msg: err.message
-        });
-
+        send('error', { msg: err.message });
         res.end();
       } catch (_) {}
     }
@@ -306,11 +370,8 @@ app.get('/ask', async (req, res) => {
 
     if (!laws.length) {
       return res.json({
-        answer: "I couldn't find relevant legal content for that question. Try rephrasing.",
-        citations: {
-          laws: [],
-          blogs: []
-        }
+        answer: "I couldn't find relevant legal content for that question. Try selecting a specific law area or rephrasing.",
+        citations: { laws: [], blogs: [] }
       });
     }
 
@@ -319,14 +380,8 @@ app.get('/ask', async (req, res) => {
       temperature: 0.1,
       max_tokens: 400,
       messages: [
-        {
-          role: 'system',
-          content: SYSTEM
-        },
-        {
-          role: 'user',
-          content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}`
-        }
+        { role: 'system', content: SYSTEM },
+        { role: 'user', content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}` }
       ]
     });
 
@@ -335,17 +390,13 @@ app.get('/ask', async (req, res) => {
       citations: citationsFrom({ laws }),
     };
 
-    cache.set(cacheKey, responseData);
+    cacheSet(cacheKey, responseData);
 
     return res.json(responseData);
 
   } catch (err) {
-
     console.error('Server Error:', err);
-
-    return res.status(500).json({
-      error: err.message || 'Internal server error'
-    });
+    return res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
