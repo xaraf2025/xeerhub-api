@@ -47,9 +47,9 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
    Set MAILCHIMP_API_KEY and MAILCHIMP_LIST_ID
    as Railway environment variables.
 ───────────────────────────────────────────── */
-const MC_API_KEY  = process.env.MAILCHIMP_API_KEY  || 
-const MC_LIST_ID  = process.env.MAILCHIMP_LIST_ID  || 
-const MC_DC       = MC_API_KEY.includes('-') ? MC_API_KEY.split('-').pop() : 'us13';
+const MC_API_KEY  = process.env.MAILCHIMP_API_KEY;
+const MC_LIST_ID  = process.env.MAILCHIMP_LIST_ID;
+const MC_DC       = (MC_API_KEY && MC_API_KEY.includes('-')) ? MC_API_KEY.split('-').pop() : 'us13';
 
 /* ─────────────────────────────────────────────
    SIMPLE MEMORY CACHE
