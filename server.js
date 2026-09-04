@@ -3,7 +3,6 @@ import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import Groq from 'groq-sdk';
-
 const requiredEnv = [
   'SUPABASE_URL',
   'SUPABASE_SERVICE_ROLE_KEY',
@@ -45,49 +44,6 @@ const groq = new Groq({
 const cache = new Map();
 
 /* ─────────────────────────────────────────────
-   BASIC PER-IP RATE LIMITER
-   /ask calls an LLM per uncached request and has no
-   auth in front of it — without a limiter, a single
-   client can burn unlimited Groq quota. This is a
-   lightweight in-memory limiter (no new dependency).
-   For multi-instance deployments (Railway can scale
-   horizontally), swap this for a shared store (Redis)
-   since in-memory counts don't share across instances.
-───────────────────────────────────────────── */
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 20;              // 20 requests / IP / minute
-const rateBuckets = new Map();
-
-function rateLimit(req, res, next) {
-  const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
-  const now = Date.now();
-  let bucket = rateBuckets.get(ip);
-
-  if (!bucket || now - bucket.windowStart > RATE_LIMIT_WINDOW_MS) {
-    bucket = { windowStart: now, count: 0 };
-    rateBuckets.set(ip, bucket);
-  }
-
-  bucket.count += 1;
-
-  if (bucket.count > RATE_LIMIT_MAX) {
-    return res.status(429).json({
-      error: 'Too many requests. Please wait a moment and try again.'
-    });
-  }
-
-  next();
-}
-
-// Periodically clear stale buckets so the map doesn't grow unbounded
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, bucket] of rateBuckets) {
-    if (now - bucket.windowStart > RATE_LIMIT_WINDOW_MS * 2) rateBuckets.delete(ip);
-  }
-}, RATE_LIMIT_WINDOW_MS * 2).unref();
-
-/* ─────────────────────────────────────────────
    LAW NAME MAP
    Maps the ?law= query param sent by the frontend
    to the exact law_name values stored in Supabase.
@@ -101,7 +57,14 @@ const LAW_NAME_MAP = {
 };
 
 /* ─────────────────────────────────────────────
-   FAST TEXT SEARCH
+   FAST TEXT SEARCH — LAWS TABLE
+   - Uses AND (plain) search so all key terms must
+     match, avoiding false positives from loose OR.
+   - Filters by law_name when a specific law is
+     provided, so "fire without notice" never
+     surfaces Foreign Investment Law articles.
+   - Falls back to broader OR search if AND yields
+     no results (handles short / sparse queries).
 ───────────────────────────────────────────── */
 async function textSearch(question, lawArea) {
 
@@ -145,22 +108,142 @@ async function textSearch(question, lawArea) {
 }
 
 /* ─────────────────────────────────────────────
-   RETRIEVE
+   LANGUAGE DETECTION
+   Cheap heuristic: count common Somali function
+   words vs. the question text. Good enough to pick
+   which qa_library columns/tsvector config to use —
+   this is NOT meant to be a full language detector.
+───────────────────────────────────────────── */
+const SOMALI_MARKERS = [
+  'maxay','maxaa','waa','sidee','ma','ku','iyo','ee','oo','ka','ah',
+  'kartaa','leeyahay','shaqaale','shaqada','xeerka','loo-shaqeeye',
+  'qodobka','waajib','xaq','miyaan','haddii'
+];
+
+function isSomali(question) {
+  const lower = question.toLowerCase();
+  const hits = SOMALI_MARKERS.filter(w =>
+    new RegExp(`\\b${w}\\b`).test(lower)
+  ).length;
+  return hits >= 2;
+}
+
+/* ─────────────────────────────────────────────
+   FAST TEXT SEARCH — QA_LIBRARY TABLE
+   Real schema (confirmed via information_schema):
+     id, law_name, article_ref_raw, question_en,
+     answer_en, question_so, answer_so, tier,
+     verified, needs_review, review_notes,
+     created_at, updated_at
+   Branches on detected language:
+     - Somali questions  -> text_search_so (simple config), question_so/answer_so
+     - English questions -> text_search (english config), question_en/answer_en
+   Requires the text_search / text_search_so generated
+   columns from import_labour_qa_somali.sql STEP 1.
+───────────────────────────────────────────── */
+async function qaLibrarySearch(question, lawArea) {
+
+  const words = question
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2)
+    .slice(0, 6);
+
+  const andTerms = words.join(' & ');
+  const orTerms  = words.join(' | ');
+
+  const lawName = LAW_NAME_MAP[lawArea] || null;
+  const somali  = isSomali(question);
+
+  const searchCol  = somali ? 'text_search_so' : 'text_search';
+  const tsConfig   = somali ? 'simple' : 'english';
+  const selectCols = somali
+    ? 'id, law_name, article_ref_raw, question_so, answer_so'
+    : 'id, law_name, article_ref_raw, question_en, answer_en';
+
+  async function runSearch(terms) {
+    let q = supabase
+      .from('qa_library')
+      .select(selectCols)
+      .textSearch(searchCol, terms, { type: 'plain', config: tsConfig })
+      .limit(3);
+
+    if (lawName) q = q.eq('law_name', lawName);
+
+    return q;
+  }
+
+  let res = await runSearch(andTerms);
+
+  if (!res.data || res.data.length === 0) {
+    res = await runSearch(orTerms);
+  }
+
+  // If the text_search / text_search_so columns don't exist yet,
+  // this throws — catch it so the whole /ask request doesn't 500.
+  if (res.error) {
+    console.error('qa_library search error:', res.error.message);
+    return { qa: [] };
+  }
+
+  // Normalise field names so buildContext/citationsFrom don't need
+  // to know which language branch was used.
+  const normalised = (res.data || []).map(row => ({
+    id: row.id,
+    law_name: row.law_name,
+    ref: row.article_ref_raw,
+    question: somali ? row.question_so : row.question_en,
+    answer: somali ? row.answer_so : row.answer_en,
+  }));
+
+  return { qa: normalised };
+}
+
+/* ─────────────────────────────────────────────
+   RETRIEVE — now pulls from BOTH laws and qa_library
+   in parallel and merges the results.
 ───────────────────────────────────────────── */
 async function retrieve(question, lawArea) {
-  return textSearch(question, lawArea);
+  const [lawsResult, qaResult] = await Promise.all([
+    textSearch(question, lawArea),
+    qaLibrarySearch(question, lawArea),
+  ]);
+
+  return {
+    laws: lawsResult.laws,
+    qa: qaResult.qa,
+  };
 }
 
 /* ─────────────────────────────────────────────
    CONTEXT BUILDER
+   Feeds both raw article text AND verified Q&A
+   pairs to Groq. The verified Q&A block is listed
+   first since it's the highest-confidence, already
+   fact-checked source.
 ───────────────────────────────────────────── */
-function buildContext({ laws }) {
-  return [
-    '==================== LAWS ====================',
+function buildContext({ laws, qa }) {
+
+  const sections = [];
+
+  if (qa && qa.length) {
+    sections.push(
+      '================ VERIFIED Q&A ================\n' +
+      qa.map((item, i) =>
+        `[QA ${i + 1}]\nLaw: ${item.law_name}\nQ: ${item.question}\nA: ${item.answer}\nRef: ${item.ref}`
+      ).join('\n\n')
+    );
+  }
+
+  sections.push(
+    '==================== LAWS ====================\n' +
     laws.map((l, i) =>
       `[LAW ${i + 1}]\nLaw: ${l.law_name}\nArticle: ${l.article_number}\nTitle: ${l.title}\nText: ${l.text.slice(0, 1200)}`
     ).join('\n\n')
-  ].join('\n');
+  );
+
+  return sections.join('\n\n');
 }
 
 /* ─────────────────────────────────────────────
@@ -169,7 +252,8 @@ function buildContext({ laws }) {
 const SYSTEM = `You are XeerHub, a Somali legal intelligence assistant.
 
 RULES:
-- Use ONLY the provided laws.
+- Use ONLY the provided laws and verified Q&A.
+- Prefer the VERIFIED Q&A block when it directly answers the question — it has already been checked against the source legislation.
 - Never invent facts.
 - Always cite law name and article number.
 - Be concise, structured, and accurate.
@@ -178,13 +262,16 @@ RULES:
 
 /* ─────────────────────────────────────────────
    CITATIONS
+   Strip any leading "Art. " / "art. " from
+   article_number — the frontend template already
+   prepends "Art. " so we must not duplicate it.
 ───────────────────────────────────────────── */
 function cleanArticleNumber(raw) {
   if (!raw) return raw;
   return raw.replace(/^art\.?\s*/i, '').trim();
 }
 
-function citationsFrom({ laws }) {
+function citationsFrom({ laws, qa }) {
   return {
     laws: laws.map(l => ({
       type: 'law',
@@ -192,6 +279,12 @@ function citationsFrom({ laws }) {
       article: cleanArticleNumber(l.article_number),
       title: l.title,
       similarity: l.similarity,
+    })),
+    qa: (qa || []).map(item => ({
+      type: 'qa',
+      law: item.law_name,
+      ref: item.ref,
+      question: item.question,
     })),
     blogs: [],
   };
@@ -201,33 +294,37 @@ function citationsFrom({ laws }) {
    ROOT
 ───────────────────────────────────────────── */
 app.get('/', (req, res) => {
-  res.json({ status: 'XeerHub API running' });
+  res.json({
+    status: 'XeerHub API running'
+  });
 });
 
 /* ─────────────────────────────────────────────
    ASK ENDPOINT
-   Rate limiter applied here — warmup pings (query
-   param warmup=1) are exempt so the frontend's
-   keep-alive pings don't eat into a user's quota.
 ───────────────────────────────────────────── */
-app.get('/ask', (req, res, next) => {
-  if (req.query.warmup === '1') return next();
-  return rateLimit(req, res, next);
-}, async (req, res) => {
+app.get('/ask', async (req, res) => {
 
+  // Warmup
   if (req.query.warmup === '1') {
-    return res.json({ status: 'warm', ok: true });
+    return res.json({
+      status: 'warm',
+      ok: true
+    });
   }
 
   const question = req.query.q?.trim();
   const lawArea  = req.query.law?.trim() || 'General';
 
   if (!question) {
-    return res.status(400).json({ error: 'Missing question' });
+    return res.status(400).json({
+      error: 'Missing question'
+    });
   }
 
+  // Cache key includes lawArea so different law filters don't share cached results
   const cacheKey = `${lawArea}::${question}`;
 
+  // Cache hit
   if (cache.has(cacheKey)) {
     return res.json(cache.get(cacheKey));
   }
@@ -249,21 +346,29 @@ app.get('/ask', (req, res, next) => {
     };
 
     try {
-      send('status', { msg: 'Searching Somali laws...' });
+
+      send('status', {
+        msg: 'Searching Somali laws...'
+      });
 
       const retrieved = await retrieve(question, lawArea);
-      const { laws } = retrieved;
 
-      send('citations', citationsFrom({ laws }));
+      const { laws, qa } = retrieved;
 
-      if (!laws.length) {
+      send('citations', citationsFrom({ laws, qa }));
+
+      if (!laws.length && !qa.length) {
+
         send('answer_done', {
           answer: "I couldn't find relevant legal content for that question in XeerHub's database. Try rephrasing your question."
         });
+
         return res.end();
       }
 
-      send('status', { msg: 'Preparing answer...' });
+      send('status', {
+        msg: 'Preparing answer...'
+      });
 
       const stream = await groq.chat.completions.create({
         model: 'llama-3.1-8b-instant',
@@ -271,27 +376,44 @@ app.get('/ask', (req, res, next) => {
         max_tokens: 400,
         stream: true,
         messages: [
-          { role: 'system', content: SYSTEM },
-          { role: 'user', content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}` }
+          {
+            role: 'system',
+            content: SYSTEM
+          },
+          {
+            role: 'user',
+            content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws, qa })}`
+          }
         ]
       });
 
       let full = '';
+
       for await (const chunk of stream) {
+
         const token = chunk.choices[0]?.delta?.content || '';
+
         if (token) {
           full += token;
           send('token', { token });
         }
       }
 
-      send('answer_done', { answer: full });
+      send('answer_done', {
+        answer: full
+      });
+
       res.end();
 
     } catch (err) {
+
       console.error('Stream error:', err);
+
       try {
-        send('error', { msg: err.message });
+        send('error', {
+          msg: err.message
+        });
+
         res.end();
       } catch (_) {}
     }
@@ -303,12 +425,17 @@ app.get('/ask', (req, res, next) => {
      JSON PATH
   ══════════════════════════════════════════ */
   try {
-    const { laws } = await retrieve(question, lawArea);
 
-    if (!laws.length) {
+    const { laws, qa } = await retrieve(question, lawArea);
+
+    if (!laws.length && !qa.length) {
       return res.json({
         answer: "I couldn't find relevant legal content for that question. Try rephrasing.",
-        citations: { laws: [], blogs: [] }
+        citations: {
+          laws: [],
+          qa: [],
+          blogs: []
+        }
       });
     }
 
@@ -317,22 +444,33 @@ app.get('/ask', (req, res, next) => {
       temperature: 0.1,
       max_tokens: 400,
       messages: [
-        { role: 'system', content: SYSTEM },
-        { role: 'user', content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}` }
+        {
+          role: 'system',
+          content: SYSTEM
+        },
+        {
+          role: 'user',
+          content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws, qa })}`
+        }
       ]
     });
 
     const responseData = {
       answer: completion?.choices?.[0]?.message?.content?.trim() || 'No answer generated.',
-      citations: citationsFrom({ laws }),
+      citations: citationsFrom({ laws, qa }),
     };
 
     cache.set(cacheKey, responseData);
+
     return res.json(responseData);
 
   } catch (err) {
+
     console.error('Server Error:', err);
-    return res.status(500).json({ error: err.message || 'Internal server error' });
+
+    return res.status(500).json({
+      error: err.message || 'Internal server error'
+    });
   }
 });
 
