@@ -113,29 +113,51 @@ async function textSearch(question, lawArea, lang) {
     .filter(w => w.length > 2)
     .slice(0, 6);
 
+  // NOTE: these are genuine tsquery operator strings ("term1 & term2",
+  // "term1 | term2"). They must be sent WITHOUT `type: 'plain'` —
+  // plainto_tsquery/websearch_to_tsquery strip operator characters and
+  // silently AND everything regardless of what string you pass in, which
+  // made the "OR fallback" below identical to the AND search and caused
+  // legitimate queries to come back empty. Omitting `type` sends the
+  // string straight to Postgres's to_tsquery(), which respects & and |.
   const andTerms = words.join(' & ');
   const orTerms  = words.join(' | ');
+  // Last-resort single-term fallback: the longest word only, OR'd against
+  // itself is pointless, so we use it for an ilike scan instead (see below).
+  const longestWord = [...words].sort((a, b) => b.length - a.length)[0] || '';
 
   const lawName = LAW_NAME_MAP[lawArea] || null;
   const column = lang === 'so' ? 'text_search_so' : 'text_search';
   const tsConfig = lang === 'so' ? 'simple' : 'english';
 
-  async function runSearch(terms) {
+  async function runSearch(terms, col, cfg) {
+    if (!terms) return { data: [] };
     let q = supabase
       .from('laws')
       .select('law_name, article_number, title, text')
-      .textSearch(column, terms, { type: 'plain', config: tsConfig })
+      .textSearch(col, terms, { config: cfg }) // no `type` — raw to_tsquery syntax
       .limit(3);
 
     if (lawName) q = q.eq('law_name', lawName);
     return q;
   }
 
-  let res = await runSearch(andTerms);
+  async function runIlike(term, col) {
+    if (!term) return { data: [] };
+    let q = supabase
+      .from('laws')
+      .select('law_name, article_number, title, text')
+      .or(`title.ilike.%${term}%,text.ilike.%${term}%`)
+      .limit(3);
+    if (lawName) q = q.eq('law_name', lawName);
+    return q;
+  }
+
+  let res = await runSearch(andTerms, column, tsConfig);
 
   // Fallback 1: OR search on the same-language column
   if (!res.data || res.data.length === 0) {
-    res = await runSearch(orTerms);
+    res = await runSearch(orTerms, column, tsConfig);
   }
 
   // Fallback 2: if a Somali query still yields nothing (e.g. the Somali
@@ -145,22 +167,19 @@ async function textSearch(question, lawArea, lang) {
   let usedFallbackColumn = false;
   if (lang === 'so' && (!res.data || res.data.length === 0)) {
     usedFallbackColumn = true;
-    let q = supabase
-      .from('laws')
-      .select('law_name, article_number, title, text')
-      .textSearch('text_search', andTerms, { type: 'plain', config: 'english' })
-      .limit(3);
-    if (lawName) q = q.eq('law_name', lawName);
-    res = await q;
+    res = await runSearch(andTerms, 'text_search', 'english');
     if (!res.data || res.data.length === 0) {
-      q = supabase
-        .from('laws')
-        .select('law_name, article_number, title, text')
-        .textSearch('text_search', orTerms, { type: 'plain', config: 'english' })
-        .limit(3);
-      if (lawName) q = q.eq('law_name', lawName);
-      res = await q;
+      res = await runSearch(orTerms, 'text_search', 'english');
     }
+  }
+
+  // Fallback 3: last resort — plain substring match on the longest
+  // keyword. Catches phrasing that doesn't match tsvector stemming at
+  // all (e.g. very short or unusually worded questions) so the user
+  // gets *something* instead of "no results" whenever the topic really
+  // is in the database.
+  if ((!res.data || res.data.length === 0) && longestWord.length >= 4) {
+    res = await runIlike(longestWord, column);
   }
 
   return {
