@@ -127,8 +127,10 @@ async function textSearch(question, lawArea, lang) {
   const longestWord = [...words].sort((a, b) => b.length - a.length)[0] || '';
 
   const lawName = LAW_NAME_MAP[lawArea] || null;
-  const column = lang === 'so' ? 'text_search_so' : 'text_search';
-  const tsConfig = lang === 'so' ? 'simple' : 'english';
+  // TEMPORARILY DISABLED: Somali path disabled until text_search_so column is populated
+  // Always use English column for now, regardless of detected language
+  const column = 'text_search';
+  const tsConfig = 'english';
 
   async function runSearch(terms, col, cfg) {
     if (!terms) return { data: [] };
@@ -335,7 +337,9 @@ app.get('/ask', async (req, res) => {
   }
 
   const lang = detectLanguage(question);
-  const useGemini = lang === 'so' && !!GEMINI_API_KEY;
+  // TEMPORARILY DISABLED: Somali path disabled until text_search_so column is populated
+  // Always route through Groq in English mode for now
+  const useGemini = false;
   const engine = useGemini ? 'gemini' : 'groq';
 
   const cacheKey = `${engine}::${lawArea}::${question}`;
@@ -363,7 +367,7 @@ app.get('/ask', async (req, res) => {
     try {
       send('status', { msg: lang === 'so' ? 'Baadhaya sharciyada...' : 'Searching Somali laws...' });
 
-      const retrieved = await retrieve(question, lawArea, lang);
+      const retrieved = await retrieve(question, lawArea, 'en');
       const { laws, usedFallbackColumn } = retrieved;
 
       send('citations', citationsFrom({ laws }, engine, usedFallbackColumn));
@@ -444,7 +448,7 @@ app.get('/ask', async (req, res) => {
      JSON PATH
   ══════════════════════════════════════════ */
   try {
-    const { laws, usedFallbackColumn } = await retrieve(question, lawArea, lang);
+    const { laws, usedFallbackColumn } = await retrieve(question, lawArea, 'en');
 
     if (!laws.length) {
       return res.json({
