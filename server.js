@@ -367,7 +367,7 @@ app.get('/ask', async (req, res) => {
     try {
       send('status', { msg: lang === 'so' ? 'Baadhaya sharciyada...' : 'Searching Somali laws...' });
 
-      const retrieved = await retrieve(question, lawArea, 'en');
+      const retrieved = await retrieve(question, lawArea, lang);
       const { laws, usedFallbackColumn } = retrieved;
 
       send('citations', citationsFrom({ laws }, engine, usedFallbackColumn));
@@ -427,7 +427,7 @@ app.get('/ask', async (req, res) => {
       if (useGemini) {
         try {
           send('status', { msg: 'Switching engine...' });
-          const retrieved = await retrieve(question, lawArea, 'en');
+          const retrieved = await retrieve(question, lawArea, lang);
           const groqAnswer = await callGroqNonStreaming(question, buildContext(retrieved));
           send('answer_done', { answer: groqAnswer || 'No answer generated.' });
           return res.end();
@@ -448,7 +448,7 @@ app.get('/ask', async (req, res) => {
      JSON PATH
   ══════════════════════════════════════════ */
   try {
-    const { laws, usedFallbackColumn } = await retrieve(question, lawArea, 'en');
+    const { laws, usedFallbackColumn } = await retrieve(question, lawArea, lang);
 
     if (!laws.length) {
       return res.json({
@@ -496,3 +496,4 @@ app.get('/ask', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`XeerHub API running on port ${PORT}`);
 });
+
