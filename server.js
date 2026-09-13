@@ -3,7 +3,6 @@ import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import Groq from 'groq-sdk';
-
 const requiredEnv = [
   'SUPABASE_URL',
   'SUPABASE_SERVICE_ROLE_KEY',
@@ -16,16 +15,6 @@ for (const key of requiredEnv) {
     process.exit(1);
   }
 }
-
-// GEMINI_API_KEY is optional at boot — if absent, Somali queries fall
-// back to Groq with an English-language system prompt override, so the
-// service never hard-fails just because the Somali path isn't configured
-// yet. Log it clearly so it's obvious in Railway logs during setup.
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-if (!GEMINI_API_KEY) {
-  console.warn('GEMINI_API_KEY not set — Somali-language queries will fall back to Groq (English).');
-}
-
 const app = express();
 
 app.use(cors({
@@ -56,6 +45,8 @@ const cache = new Map();
 
 /* ─────────────────────────────────────────────
    LAW NAME MAP
+   Maps the ?law= query param sent by the frontend
+   to the exact law_name values stored in Supabase.
 ───────────────────────────────────────────── */
 const LAW_NAME_MAP = {
   'Labor Law':              'Somalia Labour Code',
@@ -66,154 +57,115 @@ const LAW_NAME_MAP = {
 };
 
 /* ─────────────────────────────────────────────
-   LANGUAGE DETECTION — Somali stop-word heuristic
-   No API call, no added latency. Two-hit threshold
-   avoids false positives from a single loanword or
-   Somali place name inside an otherwise-English query.
-───────────────────────────────────────────── */
-const SOMALI_STOPWORDS = new Set([
-  'iyo', 'waa', 'ma', 'maxaa', 'maxay', 'sidee', 'sidaa', 'goorma',
-  'halkee', 'waxaan', 'waxay', 'waxa', 'wuxuu', 'ayaa', 'oo', 'ku',
-  'ka', 'la', 'in', 'uu', 'ay', 'miyaa', 'sow', 'immisa', 'kee', 'tee',
-  'markii', 'haddii', 'iyada', 'isaga', 'anaga', 'idinka', 'iyaga',
-  'sharci', 'sharciga', 'xeer', 'xeerka', 'shaqaale', 'shaqaalaha',
-  'shirkad', 'shirkadda', 'canshuur', 'howlaha', 'xuquuq', 'qofka',
-]);
-
-function detectLanguage(text) {
-  const words = text
-    .toLowerCase()
-    .replace(/[^a-z\s']/g, ' ')
-    .split(/\s+/)
-    .filter(Boolean);
-
-  let hits = 0;
-  for (const w of words) {
-    if (SOMALI_STOPWORDS.has(w)) hits++;
-    if (hits >= 2) return 'so';
-  }
-  return 'en';
-}
-
-/* ─────────────────────────────────────────────
    FAST TEXT SEARCH
-   NOTE: text_search / text_search_so are separate
-   tsvector columns (English config vs 'simple' config,
-   since Postgres has no Somali stemmer). We search
-   the matching column based on detected language so
-   Somali queries aren't run against an English-stemmed
-   index and silently return nothing.
+   FIX (this patch):
+   - Removed `{ type: 'plain' }`. Supabase's default
+     textSearch type is `to_tsquery`, which is what
+     actually respects the `&` (AND) and `|` (OR)
+     operators we build below. With `type: 'plain'`,
+     Postgres used `plainto_tsquery`, which strips
+     `&`/`|` as ordinary characters and ALWAYS ANDs
+     the remaining words — so the "OR fallback" was
+     silently running the same AND query a second
+     time and never actually broadening the search.
+   - Filters by law_name when a specific law is
+     provided, so "fire without notice" never
+     surfaces Foreign Investment Law articles.
+   - Falls back to broader OR search if AND yields
+     no results (handles short / sparse queries).
+   - Guards against an empty `words` array, which
+     would otherwise throw inside to_tsquery('').
 ───────────────────────────────────────────── */
-async function textSearch(question, lawArea, lang) {
+async function textSearch(question, lawArea, trace) {
 
   const words = question
     .toLowerCase()
-    .replace(/[^a-z0-9\u0600-\u06FF\s]/g, ' ') // keep Latin + Arabic-script ranges just in case
+    .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(w => w.length > 2)
     .slice(0, 6);
 
-  // NOTE: these are genuine tsquery operator strings ("term1 & term2",
-  // "term1 | term2"). They must be sent WITHOUT `type: 'plain'` —
-  // plainto_tsquery/websearch_to_tsquery strip operator characters and
-  // silently AND everything regardless of what string you pass in, which
-  // made the "OR fallback" below identical to the AND search and caused
-  // legitimate queries to come back empty. Omitting `type` sends the
-  // string straight to Postgres's to_tsquery(), which respects & and |.
+  if (trace) trace.push({ step: 'tokenize', words });
+
+  if (words.length === 0) {
+    if (trace) trace.push({ step: 'textSearch', skipped: true, reason: 'no usable words' });
+    return { laws: [], method: 'text' };
+  }
+
   const andTerms = words.join(' & ');
   const orTerms  = words.join(' | ');
-  // Last-resort single-term fallback: the longest word only, OR'd against
-  // itself is pointless, so we use it for an ilike scan instead (see below).
-  const longestWord = [...words].sort((a, b) => b.length - a.length)[0] || '';
 
+  // Resolve law_name filter (null = search all laws)
   const lawName = LAW_NAME_MAP[lawArea] || null;
-  // TEMPORARILY DISABLED: Somali path disabled until text_search_so column is populated
-  // Always use English column for now, regardless of detected language
-  const column = 'text_search';
-  const tsConfig = 'english';
 
-  async function runSearch(terms, col, cfg) {
-    if (!terms) return { data: [] };
+  async function runSearch(terms) {
     let q = supabase
       .from('laws')
       .select('law_name, article_number, title, text')
-      .textSearch(col, terms, { config: cfg }) // no `type` — raw to_tsquery syntax
+      // Default type is `to_tsquery`, which respects & and | operators.
+      // Do NOT pass { type: 'plain' } here — see note above.
+      .textSearch('text_search', terms, { config: 'english' })
       .limit(3);
 
     if (lawName) q = q.eq('law_name', lawName);
+
     return q;
   }
 
-  async function runIlike(term, col) {
-    if (!term) return { data: [] };
-    let q = supabase
-      .from('laws')
-      .select('law_name, article_number, title, text')
-      .or(`title.ilike.%${term}%,text.ilike.%${term}%`)
-      .limit(3);
-    if (lawName) q = q.eq('law_name', lawName);
-    return q;
+  // Primary: AND search (all terms must match)
+  let res = await runSearch(andTerms);
+
+  if (res.error && trace) {
+    trace.push({ step: 'textSearch:AND:error', error: res.error.message, terms: andTerms });
   }
+  if (trace) trace.push({ step: 'textSearch:AND', terms: andTerms, resultCount: res.data?.length || 0 });
 
-  let res = await runSearch(andTerms, column, tsConfig);
-
-  // Fallback 1: OR search on the same-language column
+  // Fallback: OR search if AND returns nothing
   if (!res.data || res.data.length === 0) {
-    res = await runSearch(orTerms, column, tsConfig);
-  }
+    res = await runSearch(orTerms);
 
-  // Fallback 2: if a Somali query still yields nothing (e.g. the Somali
-  // column isn't populated for this law yet — extraction is in progress
-  // per the roadmap), fall back to the English column so the user still
-  // gets an answer rather than silence, and we flag that in the response.
-  let usedFallbackColumn = false;
-  if (lang === 'so' && (!res.data || res.data.length === 0)) {
-    usedFallbackColumn = true;
-    res = await runSearch(andTerms, 'text_search', 'english');
-    if (!res.data || res.data.length === 0) {
-      res = await runSearch(orTerms, 'text_search', 'english');
+    if (res.error && trace) {
+      trace.push({ step: 'textSearch:OR:error', error: res.error.message, terms: orTerms });
     }
+    if (trace) trace.push({ step: 'textSearch:OR', terms: orTerms, resultCount: res.data?.length || 0 });
   }
 
-  // Fallback 3: last resort — plain substring match on the longest
-  // keyword. Catches phrasing that doesn't match tsvector stemming at
-  // all (e.g. very short or unusually worded questions) so the user
-  // gets *something* instead of "no results" whenever the topic really
-  // is in the database.
-  if ((!res.data || res.data.length === 0) && longestWord.length >= 4) {
-    res = await runIlike(longestWord, column);
+  if (res.error) {
+    console.error('Supabase textSearch error:', res.error);
   }
 
   return {
     laws: res.data || [],
     method: 'text',
-    usedFallbackColumn,
   };
 }
 
 /* ─────────────────────────────────────────────
    RETRIEVE
 ───────────────────────────────────────────── */
-async function retrieve(question, lawArea, lang) {
-  return textSearch(question, lawArea, lang);
+async function retrieve(question, lawArea, trace) {
+  return textSearch(question, lawArea, trace);
 }
 
 /* ─────────────────────────────────────────────
    CONTEXT BUILDER
 ───────────────────────────────────────────── */
 function buildContext({ laws }) {
+
   return [
     '==================== LAWS ====================',
+
     laws.map((l, i) =>
       `[LAW ${i + 1}]\nLaw: ${l.law_name}\nArticle: ${l.article_number}\nTitle: ${l.title}\nText: ${l.text.slice(0, 1200)}`
     ).join('\n\n')
+
   ].join('\n');
 }
 
 /* ─────────────────────────────────────────────
-   SYSTEM PROMPTS
+   SYSTEM PROMPT
 ───────────────────────────────────────────── */
-const SYSTEM_EN = `You are XeerHub, a Somali legal intelligence assistant.
+const SYSTEM = `You are XeerHub, a Somali legal intelligence assistant.
 
 RULES:
 - Use ONLY the provided laws.
@@ -223,82 +175,18 @@ RULES:
 - If context is insufficient, say so clearly.
 - Write in plain English for lawyers, NGOs, and business professionals.`;
 
-const SYSTEM_SO = `Waxaad tahay XeerHub, kaaliye caqli-gal oo ku takhasusay sharciyada Soomaaliya.
-
-XERAYADA:
-- Isticmaal KALIYA sharciyada la siiyay.
-- Ha been-abuurin xaqiiqooyin.
-- Had iyo jeer sheeg magaca sharciga iyo lambarka qodobka (Article).
-- Noqo mid kooban, habaysan, oo sax ah.
-- Haddii macluumaadku ku filnayn, si cad u sheeg.
-- Ku qor Af-Soomaali oo fudud, si ay u fahmaan qareenno, hay'ado bulsho, iyo ganacsato.`;
-
-/* ─────────────────────────────────────────────
-   MODEL CALLS
-   callGroq  → llama-3.1-8b-instant (English default)
-   callGemini → gemini-2.5-flash via REST (Somali path)
-   Both expose the same shape: { text, stream? }
-   Gemini is called non-streaming and then chunked for
-   the SSE path — true token-level streaming from Gemini's
-   streamGenerateContent endpoint is a follow-up item, not
-   required for the current demo.
-───────────────────────────────────────────── */
-async function callGeminiNonStreaming(question, context) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-
-  const body = {
-    systemInstruction: {
-      parts: [{ text: SYSTEM_SO }]
-    },
-    contents: [{
-      role: 'user',
-      parts: [{ text: `SU'AAL: ${question}\n\nCONTEXT:\n${context}` }]
-    }],
-    generationConfig: {
-      temperature: 0.1,
-      maxOutputTokens: 500,
-    }
-  };
-
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    const errText = await resp.text().catch(() => '');
-    throw new Error(`Gemini API error (${resp.status}): ${errText.slice(0, 300)}`);
-  }
-
-  const data = await resp.json();
-  const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
-  if (!text) throw new Error('Gemini returned an empty response');
-  return text;
-}
-
-async function callGroqNonStreaming(question, context) {
-  const completion = await groq.chat.completions.create({
-    model: 'llama-3.1-8b-instant',
-    temperature: 0.1,
-    max_tokens: 400,
-    messages: [
-      { role: 'system', content: SYSTEM_EN },
-      { role: 'user', content: `QUESTION: ${question}\n\nCONTEXT:\n${context}` }
-    ]
-  });
-  return completion?.choices?.[0]?.message?.content?.trim() || '';
-}
-
 /* ─────────────────────────────────────────────
    CITATIONS
+   Strip any leading "Art. " / "art. " from
+   article_number — the frontend template already
+   prepends "Art. " so we must not duplicate it.
 ───────────────────────────────────────────── */
 function cleanArticleNumber(raw) {
   if (!raw) return raw;
   return raw.replace(/^art\.?\s*/i, '').trim();
 }
 
-function citationsFrom({ laws }, engine, usedFallbackColumn) {
+function citationsFrom({ laws }) {
   return {
     laws: laws.map(l => ({
       type: 'law',
@@ -308,8 +196,6 @@ function citationsFrom({ laws }, engine, usedFallbackColumn) {
       similarity: l.similarity,
     })),
     blogs: [],
-    engine,              // 'groq' | 'gemini' — surfaced for demo transparency
-    usedFallbackColumn,  // true if a Somali query had to fall back to the English index
   };
 }
 
@@ -317,7 +203,9 @@ function citationsFrom({ laws }, engine, usedFallbackColumn) {
    ROOT
 ───────────────────────────────────────────── */
 app.get('/', (req, res) => {
-  res.json({ status: 'XeerHub API running' });
+  res.json({
+    status: 'XeerHub API running'
+  });
 });
 
 /* ─────────────────────────────────────────────
@@ -325,27 +213,52 @@ app.get('/', (req, res) => {
 ───────────────────────────────────────────── */
 app.get('/ask', async (req, res) => {
 
+  // Warmup
   if (req.query.warmup === '1') {
-    return res.json({ status: 'warm', ok: true });
+    return res.json({
+      status: 'warm',
+      ok: true
+    });
   }
 
   const question = req.query.q?.trim();
   const lawArea  = req.query.law?.trim() || 'General';
+  const debug    = req.query.debug === '1';
+  const trace    = debug ? [] : null;
 
   if (!question) {
-    return res.status(400).json({ error: 'Missing question' });
+    return res.status(400).json({
+      error: 'Missing question'
+    });
   }
 
-  const lang = detectLanguage(question);
-  // TEMPORARILY DISABLED: Somali path disabled until text_search_so column is populated
-  // Always route through Groq in English mode for now
-  const useGemini = false;
-  const engine = useGemini ? 'gemini' : 'groq';
+  // Cache key includes lawArea so different law filters don't share cached results
+  const cacheKey = `${lawArea}::${question}`;
 
-  const cacheKey = `${engine}::${lawArea}::${question}`;
-
-  if (cache.has(cacheKey)) {
+  // Cache hit (skip cache entirely in debug mode so trace is always fresh)
+  if (!debug && cache.has(cacheKey)) {
     return res.json(cache.get(cacheKey));
+  }
+
+  /* ══════════════════════════════════════════
+     DEBUG PATH — returns raw retrieval trace,
+     never calls Groq. Use to diagnose empty
+     answers: /ask?q=...&law=...&debug=1
+  ══════════════════════════════════════════ */
+  if (debug) {
+    try {
+      const retrieved = await retrieve(question, lawArea, trace);
+      return res.json({
+        question,
+        lawArea,
+        resolvedLawName: LAW_NAME_MAP[lawArea] || null,
+        trace,
+        laws: retrieved.laws,
+      });
+    } catch (err) {
+      trace.push({ step: 'error', message: err.message, stack: err.stack });
+      return res.status(500).json({ trace, error: err.message });
+    }
   }
 
   /* ══════════════════════════════════════════
@@ -365,78 +278,74 @@ app.get('/ask', async (req, res) => {
     };
 
     try {
-      send('status', { msg: lang === 'so' ? 'Baadhaya sharciyada...' : 'Searching Somali laws...' });
 
-      const retrieved = await retrieve(question, lawArea, 'en');
-      const { laws, usedFallbackColumn } = retrieved;
+      send('status', {
+        msg: 'Searching Somali laws...'
+      });
 
-      send('citations', citationsFrom({ laws }, engine, usedFallbackColumn));
+      const retrieved = await retrieve(question, lawArea);
+
+      const { laws } = retrieved;
+
+      send('citations', citationsFrom({ laws }));
 
       if (!laws.length) {
+
         send('answer_done', {
-          answer: lang === 'so'
-            ? "Ma helin macluumaad sharci ah oo la xiriira su'aashaada. Fadlan isku day inaad si kale u qorto su'aasha."
-            : "I couldn't find relevant legal content for that question in XeerHub's database. Try rephrasing your question."
+          answer: "I couldn't find relevant legal content for that question in XeerHub's database. Try rephrasing your question."
         });
+
         return res.end();
       }
 
-      send('status', { msg: lang === 'so' ? 'Diyaarinaya jawaabta...' : 'Preparing answer...' });
+      send('status', {
+        msg: 'Preparing answer...'
+      });
 
-      if (useGemini) {
-        // Gemini path: non-streaming call, then chunk the result so the
-        // frontend's token-by-token rendering still works identically.
-        const full = await callGeminiNonStreaming(question, buildContext({ laws }));
-        const words = full.split(/(\s+)/); // keep whitespace tokens so spacing is preserved
-        for (const w of words) {
-          if (w) send('token', { token: w });
-          // tiny delay to simulate streaming cadence without adding real latency cost
-          await new Promise(r => setTimeout(r, 12));
-        }
-        send('answer_done', { answer: full });
-      } else {
-        // Groq path: real token streaming, as before.
-        const stream = await groq.chat.completions.create({
-          model: 'llama-3.1-8b-instant',
-          temperature: 0.1,
-          max_tokens: 400,
-          stream: true,
-          messages: [
-            { role: 'system', content: SYSTEM_EN },
-            { role: 'user', content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}` }
-          ]
-        });
-
-        let full = '';
-        for await (const chunk of stream) {
-          const token = chunk.choices[0]?.delta?.content || '';
-          if (token) {
-            full += token;
-            send('token', { token });
+      const stream = await groq.chat.completions.create({
+        model: 'llama-3.1-8b-instant',
+        temperature: 0.1,
+        max_tokens: 400,
+        stream: true,
+        messages: [
+          {
+            role: 'system',
+            content: SYSTEM
+          },
+          {
+            role: 'user',
+            content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}`
           }
+        ]
+      });
+
+      let full = '';
+
+      for await (const chunk of stream) {
+
+        const token = chunk.choices[0]?.delta?.content || '';
+
+        if (token) {
+          full += token;
+          send('token', { token });
         }
-        send('answer_done', { answer: full });
       }
+
+      send('answer_done', {
+        answer: full
+      });
 
       res.end();
 
     } catch (err) {
+
       console.error('Stream error:', err);
-      // If Gemini fails mid-request (e.g. bad key, quota), fall back to
-      // Groq rather than leaving the user with a dead stream.
-      if (useGemini) {
-        try {
-          send('status', { msg: 'Switching engine...' });
-          const retrieved = await retrieve(question, lawArea, 'en');
-          const groqAnswer = await callGroqNonStreaming(question, buildContext(retrieved));
-          send('answer_done', { answer: groqAnswer || 'No answer generated.' });
-          return res.end();
-        } catch (fallbackErr) {
-          console.error('Gemini fallback also failed:', fallbackErr);
-        }
-      }
+
       try {
-        send('error', { msg: err.message });
+        send('error', {
+          msg: err.message
+        });
+
         res.end();
       } catch (_) {}
     }
@@ -448,45 +357,51 @@ app.get('/ask', async (req, res) => {
      JSON PATH
   ══════════════════════════════════════════ */
   try {
-    const { laws, usedFallbackColumn } = await retrieve(question, lawArea, 'en');
+
+    const { laws } = await retrieve(question, lawArea);
 
     if (!laws.length) {
       return res.json({
-        answer: lang === 'so'
-          ? "Ma helin macluumaad sharci ah oo la xiriira su'aashaada."
-          : "I couldn't find relevant legal content for that question. Try rephrasing.",
-        citations: { laws: [], blogs: [], engine, usedFallbackColumn: false }
+        answer: "I couldn't find relevant legal content for that question. Try rephrasing.",
+        citations: {
+          laws: [],
+          blogs: []
+        }
       });
     }
 
-    const context = buildContext({ laws });
-    let answerText;
-
-    try {
-      answerText = useGemini
-        ? await callGeminiNonStreaming(question, context)
-        : await callGroqNonStreaming(question, context);
-    } catch (modelErr) {
-      // Same fallback logic as the streaming path.
-      if (useGemini) {
-        console.error('Gemini error, falling back to Groq:', modelErr);
-        answerText = await callGroqNonStreaming(question, context);
-      } else {
-        throw modelErr;
-      }
-    }
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.1-8b-instant',
+      temperature: 0.1,
+      max_tokens: 400,
+      messages: [
+        {
+          role: 'system',
+          content: SYSTEM
+        },
+        {
+          role: 'user',
+          content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}`
+        }
+      ]
+    });
 
     const responseData = {
-      answer: answerText || 'No answer generated.',
-      citations: citationsFrom({ laws }, engine, usedFallbackColumn),
+      answer: completion?.choices?.[0]?.message?.content?.trim() || 'No answer generated.',
+      citations: citationsFrom({ laws }),
     };
 
     cache.set(cacheKey, responseData);
+
     return res.json(responseData);
 
   } catch (err) {
+
     console.error('Server Error:', err);
-    return res.status(500).json({ error: err.message || 'Internal server error' });
+
+    return res.status(500).json({
+      error: err.message || 'Internal server error'
+    });
   }
 });
 
