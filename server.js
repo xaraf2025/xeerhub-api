@@ -52,8 +52,11 @@ const LAW_NAME_MAP = {
   'Labor Law':              'Somalia Labour Code',
   'Foreign Investment Law': 'Foreign Investment Law',
   'Income Tax Law':         'Income Tax Act 2025',
-  'Environmental Law':      'Environmental Protection and Management Act 2024',
-  'Data Protection Law':    'Data Protection Act',
+  // FIX: these two previously mapped to values that don't exist in the
+  // `laws` table (confirmed via direct query of distinct law_name values).
+  // Any filtered search on these two areas was matching zero rows.
+  'Environmental Law':      'Environmental Law',
+  'Data Protection Law':    'Data Protection Law',
 };
 
 /* ─────────────────────────────────────────────
