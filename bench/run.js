@@ -40,14 +40,17 @@ async function runOne(tc) {
   }
   const fused = body.fused || [];
   const gate = body.gate;
+  const signals = body.signals || {};
+  const gateReason = body.gateReason || null;
+  const modelLoaded = body.modelLoaded;
 
   if (tc.outOfScope) {
     const pass = gate === 'none';
     return {
       id: tc.id, question: tc.question, expectedLaw: null, expectedArticles: [],
       retrieved: fused.map(f => `${f.law_name} · ${f.article_number}`),
-      gate, pass,
-      reason: pass ? 'correctly returned no match' : `expected gate=none but got gate=${gate}`,
+      gate, gateReason, signals, modelLoaded, pass,
+      reason: pass ? 'correctly returned no match' : `expected gate=none but got gate=${gate} (${gateReason})`,
     };
   }
 
@@ -62,16 +65,16 @@ async function runOne(tc) {
   const pass = gate === 'supported' && hit3;
 
   let reason = 'ok';
-  if (gate === 'none') reason = 'gate=none — nothing retrieved';
-  else if (gate === 'weak') reason = 'gate=weak — below supported threshold';
+  if (gate === 'none') reason = `gate=none — ${gateReason}`;
+  else if (gate === 'weak') reason = `gate=weak — ${gateReason}`;
   else if (hitRank === -1) reason = 'expected article not in top results';
   else if (!hit1) reason = `correct article present but ranked #${hitRank + 1}`;
 
   return {
     id: tc.id, cluster: tc.cluster || null, question: tc.question,
     expectedLaw: tc.expectedLaw, expectedArticles: tc.expectedArticles,
-    retrieved: fused.map(f => `${f.law_name} · ${f.article_number} (score ${f.score?.toFixed(4)})`),
-    gate, hitRank, hit1, hit3, mrr, pass, reason,
+    retrieved: fused.map(f => `${f.law_name} · ${f.article_number} (rrf ${f.score?.toFixed(4)}${typeof f.similarity === 'number' ? ', cos ' + f.similarity.toFixed(3) : ''}; ${(f.hitBy || []).join('+')})`),
+    gate, gateReason, signals, modelLoaded, hitRank, hit1, hit3, mrr, pass, reason,
   };
 }
 
@@ -99,6 +102,38 @@ async function main() {
   console.log(`hit@3              : ${(hit3Rate * 100).toFixed(1)}%`);
   console.log(`MRR                : ${mrrAvg.toFixed(3)}`);
   console.log(`Out-of-scope guard : ${(oosPassRate * 100).toFixed(1)}% correctly returned no match (${oos.length} cases)`);
+
+  // ── Signal diagnostics: is the vector path alive, and where do the similarities sit?
+  const vecDead = results.filter(r => r.signals && r.signals.vectorAvailable === false).length;
+  const modelDown = results.filter(r => r.modelLoaded === false).length;
+  console.log('\n──────────── SIGNALS (for calibrating the gate) ────────────');
+  console.log(`Vector returned 0 rows : ${vecDead} / ${results.length}`);
+  console.log(`Model not loaded       : ${modelDown} / ${results.length}`);
+  if (vecDead === results.length) {
+    console.log('!! Vector retrieval contributed NOTHING to any question. Fix that first —');
+    console.log('!! run:  curl "' + API_BASE + '/ask?q=test&debug=1"  and read the "vector" step in trace.');
+  }
+  const stats = arr => {
+    const v = arr.filter(x => typeof x === 'number').sort((a, b) => a - b);
+    if (!v.length) return 'n/a';
+    const q = p => v[Math.min(v.length - 1, Math.floor(p * v.length))].toFixed(3);
+    return `min ${v[0].toFixed(3)} | p25 ${q(0.25)} | median ${q(0.5)} | p75 ${q(0.75)} | max ${v[v.length - 1].toFixed(3)}`;
+  };
+  const inScopeTop = inScope.filter(r => r.hit3).map(r => r.signals?.vecTop);
+  const inScopeMiss = inScope.filter(r => !r.hit3).map(r => r.signals?.vecTop);
+  const oosTop = oos.map(r => r.signals?.vecTop);
+  console.log(`vecTop, in-scope, article found (hit@3) : ${stats(inScopeTop)}`);
+  console.log(`vecTop, in-scope, article NOT found     : ${stats(inScopeMiss)}`);
+  console.log(`vecTop, out-of-scope                    : ${stats(oosTop)}`);
+  console.log('Set VEC_SUPPORTED just below the low end of the first row, VEC_WEAK just above the high end of the last row.');
+
+  const failing = results.filter(r => !r.pass);
+  if (failing.length) {
+    console.log('\nFailure reasons:');
+    const byReason = {};
+    failing.forEach(r => { byReason[r.reason] = (byReason[r.reason] || 0) + 1; });
+    Object.entries(byReason).sort((a, b) => b[1] - a[1]).forEach(([k, v]) => console.log(`  ${v} × ${k}`));
+  }
 
   fs.writeFileSync(
     new URL('./results.json', import.meta.url),
