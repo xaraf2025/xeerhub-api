@@ -3,260 +3,365 @@ import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import Groq from 'groq-sdk';
-const requiredEnv = [
-  'SUPABASE_URL',
-  'SUPABASE_SERVICE_ROLE_KEY',
-  'GROQ_API_KEY'
-];
+import { pipeline } from '@huggingface/transformers';
 
+const requiredEnv = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'GROQ_API_KEY'];
 for (const key of requiredEnv) {
   if (!process.env[key]) {
     console.error(`Missing ENV: ${key}`);
     process.exit(1);
   }
 }
+
 const app = express();
-
 app.use(cors({
-  origin: [
-    'https://xeerhub.com',
-    'https://www.xeerhub.com',
-    'http://localhost:3000'
-  ],
+  origin: ['https://xeerhub.com', 'https://www.xeerhub.com', 'http://localhost:3000'],
 }));
-
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY
-});
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 /* ─────────────────────────────────────────────
-   SIMPLE MEMORY CACHE
+   EMBEDDING MODEL — loaded once at boot.
+   In-process, so query vectors and the embedding_v2
+   document vectors come from the same pipeline —
+   this is required, not optional: embedding_hf
+   (produced by the HF hosted API) was confirmed to
+   NOT reproduce with this in-process model on the
+   same text (mean cos ~0.88), so mixing them would
+   silently produce wrong rankings.
+   If the model fails to load, the service degrades
+   to FTS + exact-match only and says so in responses
+   — it never fails silently.
+───────────────────────────────────────────── */
+let embedder = null;
+let embedderError = null;
+(async () => {
+  try {
+    embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', { dtype: 'fp32' });
+    console.log('Embedding model loaded.');
+  } catch (err) {
+    embedderError = err;
+    console.error('Embedding model failed to load — degrading to FTS + exact-match only:', err.message);
+  }
+})();
+
+async function embedQuery(text) {
+  if (!embedder) return null;
+  const out = await embedder(text, { pooling: 'mean', normalize: true });
+  return Array.from(out.data);
+}
+
+/* ─────────────────────────────────────────────
+   CACHE
 ───────────────────────────────────────────── */
 const cache = new Map();
 
 /* ─────────────────────────────────────────────
-   LAW NAME MAP
-   Maps the ?law= query param sent by the frontend
-   to the exact law_name values stored in Supabase.
+   LAW NAME MAP — must match the exact law_name
+   values in Supabase (confirmed via direct query).
 ───────────────────────────────────────────── */
 const LAW_NAME_MAP = {
   'Labor Law':              'Somalia Labour Code',
   'Foreign Investment Law': 'Foreign Investment Law',
   'Income Tax Law':         'Income Tax Act 2025',
-  // FIX: these two previously mapped to values that don't exist in the
-  // `laws` table (confirmed via direct query of distinct law_name values).
-  // Any filtered search on these two areas was matching zero rows.
   'Environmental Law':      'Environmental Law',
   'Data Protection Law':    'Data Protection Law',
 };
 
 /* ─────────────────────────────────────────────
-   FAST TEXT SEARCH
-   FIX (this patch):
-   - Removed `{ type: 'plain' }`. Supabase's default
-     textSearch type is `to_tsquery`, which is what
-     actually respects the `&` (AND) and `|` (OR)
-     operators we build below. With `type: 'plain'`,
-     Postgres used `plainto_tsquery`, which strips
-     `&`/`|` as ordinary characters and ALWAYS ANDs
-     the remaining words — so the "OR fallback" was
-     silently running the same AND query a second
-     time and never actually broadening the search.
-   - Filters by law_name when a specific law is
-     provided, so "fire without notice" never
-     surfaces Foreign Investment Law articles.
-   - Falls back to broader OR search if AND yields
-     no results (handles short / sparse queries).
-   - Guards against an empty `words` array, which
-     would otherwise throw inside to_tsquery('').
+   QUERY NORMALIZATION
 ───────────────────────────────────────────── */
-async function textSearch(question, lawArea, trace) {
+const STOPWORDS = new Set([
+  'the','a','an','and','or','of','to','in','on','for','is','are','was','were',
+  'be','been','being','my','your','their','his','her','its','our','do','does',
+  'did','can','could','should','would','will','shall','may','might','must',
+  'what','when','where','which','who','how','with','from','that','this','it',
+  'as','at','by','if','so','than','then','also','into','have','has','had',
+]);
 
-  const words = question
+// Small curated glossary to bridge everyday phrasing to statutory vocabulary.
+// This does NOT replace semantic search — it's a cheap, auditable boost for
+// the FTS side specifically, where lexical overlap is everything.
+const SYNONYMS = {
+  fire: ['terminate', 'dismiss', 'dismissal'],
+  fired: ['terminated', 'dismissed'],
+  boss: ['employer'],
+  salary: ['wage', 'wages', 'remuneration'],
+  pay: ['wage', 'wages', 'remuneration'],
+  paycheck: ['wage', 'wages'],
+  cut: ['reduce', 'reduction', 'deduction', 'deductions'],
+  quit: ['resign', 'resignation'],
+  sick: ['illness', 'medical'],
+  maternity: ['pregnancy', 'pregnant'],
+  invest: ['investment', 'investor'],
+  tax: ['taxation', 'taxable'],
+};
+
+function tokenize(question) {
+  return question
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
-    .filter(w => w.length > 2)
-    .slice(0, 6);
+    .filter(w => w.length > 2 && !STOPWORDS.has(w))
+    .slice(0, 14); // generous cap — just a sanity limit, not a truncation bug
+}
 
-  if (trace) trace.push({ step: 'tokenize', words });
+function expandWithSynonyms(words) {
+  const expanded = new Set(words);
+  for (const w of words) {
+    if (SYNONYMS[w]) SYNONYMS[w].forEach(s => expanded.add(s));
+  }
+  return [...expanded];
+}
 
+// Detects an explicit article/regulation reference in the question, e.g.
+// "article 85", "art. 18", "regulation 9-1". Used for the exact-match
+// retriever — this is the one retriever that should behave like a lookup,
+// not a ranked search.
+function extractArticleRef(question) {
+  const m = question.match(/\b(?:art(?:icle)?\.?|reg(?:ulation)?\.?)\s*(\d+(?:-\d+)?)/i);
+  return m ? m[1] : null;
+}
+
+// Normalizes messy article_number formats ("Art. 6", "ITA 2025 · Art. 12",
+// "79, 84") down to the set of bare numbers they contain, for comparison.
+function extractNumbers(raw) {
+  if (!raw) return [];
+  return [...raw.matchAll(/\d+(?:-\d+)?/g)].map(m => m[0]);
+}
+
+/* ─────────────────────────────────────────────
+   RETRIEVERS
+   Each returns an array of { id, law_name, article_number, title, text, _rank }
+   in best-first order. Ranks are 0-indexed for RRF.
+───────────────────────────────────────────── */
+
+async function retrieveVector(question, lawName, trace) {
+  if (!embedder) {
+    if (trace) trace.push({ step: 'vector', skipped: true, reason: embedderError?.message || 'model not loaded' });
+    return [];
+  }
+  const vec = await embedQuery(question);
+  const { data, error } = await supabase.rpc('match_laws_v2', {
+    query_embedding: vec,
+    match_count: 8,
+    law_filter: lawName,
+  });
+  if (error) {
+    if (trace) trace.push({ step: 'vector:error', error: error.message });
+    return [];
+  }
+  if (trace) trace.push({ step: 'vector', resultCount: data?.length || 0, top: data?.[0] && { article: data[0].article_number, similarity: data[0].similarity } });
+  return data || [];
+}
+
+async function retrieveFTS(question, lawName, trace) {
+  const words = tokenize(question);
   if (words.length === 0) {
-    if (trace) trace.push({ step: 'textSearch', skipped: true, reason: 'no usable words' });
-    return { laws: [], method: 'text' };
+    if (trace) trace.push({ step: 'fts', skipped: true, reason: 'no usable words' });
+    return [];
+  }
+  const expanded = expandWithSynonyms(words);
+
+  async function run(terms) {
+    return supabase.rpc('search_laws_fts', {
+      tsquery_text: terms,
+      match_count: 8,
+      law_filter: lawName,
+    });
   }
 
-  const andTerms = words.join(' & ');
-  const orTerms  = words.join(' | ');
+  // AND first (precise), OR fallback with synonym expansion (broad).
+  let res = await run(words.join(' & '));
+  if (trace) trace.push({ step: 'fts:AND', terms: words.join(' & '), resultCount: res.data?.length || 0, error: res.error?.message });
 
-  // Resolve law_name filter (null = search all laws)
-  const lawName = LAW_NAME_MAP[lawArea] || null;
-
-  async function runSearch(terms) {
-    let q = supabase
-      .from('laws')
-      .select('law_name, article_number, title, text')
-      // Default type is `to_tsquery`, which respects & and | operators.
-      // Do NOT pass { type: 'plain' } here — see note above.
-      .textSearch('text_search', terms, { config: 'english' })
-      .limit(3);
-
-    if (lawName) q = q.eq('law_name', lawName);
-
-    return q;
-  }
-
-  // Primary: AND search (all terms must match)
-  let res = await runSearch(andTerms);
-
-  if (res.error && trace) {
-    trace.push({ step: 'textSearch:AND:error', error: res.error.message, terms: andTerms });
-  }
-  if (trace) trace.push({ step: 'textSearch:AND', terms: andTerms, resultCount: res.data?.length || 0 });
-
-  // Fallback: OR search if AND returns nothing
   if (!res.data || res.data.length === 0) {
-    res = await runSearch(orTerms);
-
-    if (res.error && trace) {
-      trace.push({ step: 'textSearch:OR:error', error: res.error.message, terms: orTerms });
-    }
-    if (trace) trace.push({ step: 'textSearch:OR', terms: orTerms, resultCount: res.data?.length || 0 });
+    res = await run(expanded.join(' | '));
+    if (trace) trace.push({ step: 'fts:OR', terms: expanded.join(' | '), resultCount: res.data?.length || 0, error: res.error?.message });
   }
+  return res.data || [];
+}
 
-  if (res.error) {
-    console.error('Supabase textSearch error:', res.error);
+async function retrieveExact(question, lawName, trace) {
+  const ref = extractArticleRef(question);
+  if (!ref) {
+    if (trace) trace.push({ step: 'exact', skipped: true, reason: 'no article reference detected' });
+    return [];
   }
-
-  return {
-    laws: res.data || [],
-    method: 'text',
-  };
+  let q = supabase
+    .from('laws')
+    .select('id, law_name, article_number, title, text')
+    .ilike('article_number', `%${ref}%`)
+    .limit(5);
+  if (lawName) q = q.eq('law_name', lawName);
+  const { data, error } = await q;
+  if (trace) trace.push({ step: 'exact', ref, resultCount: data?.length || 0, error: error?.message });
+  return data || [];
 }
 
 /* ─────────────────────────────────────────────
-   RETRIEVE
+   FUSION (Reciprocal Rank Fusion) + GATE
+
+   Thresholds below are provisional defaults, not
+   benchmark-calibrated — see the pending benchmark
+   task. They're deliberately conservative: better to
+   under-answer than to hand Groq weak context.
 ───────────────────────────────────────────── */
+const RRF_K = 60;
+const EXACT_MATCH_BOOST = 1.0; // exact-article hits are added on top of RRF, not merely ranked
+
+function fuse({ vectorResults, ftsResults, exactResults }) {
+  const scores = new Map(); // id -> { row, score, hitBy: Set }
+
+  function addList(list, label) {
+    list.forEach((row, rank) => {
+      const key = row.id;
+      const entry = scores.get(key) || { row, score: 0, hitBy: new Set() };
+      entry.score += 1 / (RRF_K + rank);
+      entry.hitBy.add(label);
+      scores.set(key, entry);
+    });
+  }
+
+  addList(vectorResults, 'vector');
+  addList(ftsResults, 'fts');
+
+  // Exact-article hits get a flat boost rather than an RRF rank — an
+  // explicit "Article 85" reference in the question should dominate
+  // regardless of how the other two retrievers rank things.
+  exactResults.forEach(row => {
+    const key = row.id;
+    const entry = scores.get(key) || { row, score: 0, hitBy: new Set() };
+    entry.score += EXACT_MATCH_BOOST;
+    entry.hitBy.add('exact');
+    scores.set(key, entry);
+  });
+
+  const fused = [...scores.values()]
+    .sort((a, b) => b.score - a.score)
+    .map(e => ({ ...e.row, _score: e.score, _hitBy: [...e.hitBy] }));
+
+  return fused;
+}
+
+// Three-state gate. "supported" calls Groq; "weak" and "none" never do.
+function gate(fused) {
+  if (fused.length === 0) return { state: 'none', top: null };
+  const top = fused[0];
+  const multiRetriever = top._hitBy.length >= 2;
+  const hasExact = top._hitBy.includes('exact');
+  if (hasExact || multiRetriever || top._score >= 0.03) {
+    return { state: 'supported', top };
+  }
+  if (top._score >= 0.012) {
+    return { state: 'weak', top };
+  }
+  return { state: 'none', top };
+}
+
 async function retrieve(question, lawArea, trace) {
-  return textSearch(question, lawArea, trace);
+  const lawName = LAW_NAME_MAP[lawArea] || null;
+  const [vectorResults, ftsResults, exactResults] = await Promise.all([
+    retrieveVector(question, lawName, trace),
+    retrieveFTS(question, lawName, trace),
+    retrieveExact(question, lawName, trace),
+  ]);
+  const fused = fuse({ vectorResults, ftsResults, exactResults });
+  const gateResult = gate(fused);
+  if (trace) trace.push({ step: 'fuse', fusedCount: fused.length, gate: gateResult.state, topScore: fused[0]?._score });
+  return { fused: fused.slice(0, 5), gate: gateResult.state };
 }
 
 /* ─────────────────────────────────────────────
-   CONTEXT BUILDER
+   CONTEXT + CITATIONS
+   Citations are built ONLY from fused `laws` rows —
+   never from qa_library (0% verified — see project
+   notes) and never invented by the model.
 ───────────────────────────────────────────── */
-function buildContext({ laws }) {
-
+function buildContext(fused) {
   return [
     '==================== LAWS ====================',
-
-    laws.map((l, i) =>
-      `[LAW ${i + 1}]\nLaw: ${l.law_name}\nArticle: ${l.article_number}\nTitle: ${l.title}\nText: ${l.text.slice(0, 1200)}`
-    ).join('\n\n')
-
+    fused.map((l, i) =>
+      `[LAW ${i + 1}]\nLaw: ${l.law_name}\nArticle: ${l.article_number}\nTitle: ${l.title}\nText: ${l.text}`
+    ).join('\n\n'),
   ].join('\n');
 }
 
-/* ─────────────────────────────────────────────
-   SYSTEM PROMPT
-───────────────────────────────────────────── */
-const SYSTEM = `You are XeerHub, a Somali legal intelligence assistant.
-
-RULES:
-- Use ONLY the provided laws.
-- Never invent facts.
-- Always cite law name and article number.
-- Be concise, structured, and accurate.
-- If context is insufficient, say so clearly.
-- Write in plain English for lawyers, NGOs, and business professionals.`;
-
-/* ─────────────────────────────────────────────
-   CITATIONS
-   Strip any leading "Art. " / "art. " from
-   article_number — the frontend template already
-   prepends "Art. " so we must not duplicate it.
-───────────────────────────────────────────── */
 function cleanArticleNumber(raw) {
   if (!raw) return raw;
   return raw.replace(/^art\.?\s*/i, '').trim();
 }
 
-function citationsFrom({ laws }) {
+function citationsFrom(fused) {
   return {
-    laws: laws.map(l => ({
+    laws: fused.map(l => ({
       type: 'law',
       law: l.law_name,
       article: cleanArticleNumber(l.article_number),
       title: l.title,
-      similarity: l.similarity,
+      similarity: l._score,
+      matchedBy: l._hitBy,
     })),
     blogs: [],
   };
 }
 
-/* ─────────────────────────────────────────────
-   ROOT
-───────────────────────────────────────────── */
-app.get('/', (req, res) => {
-  res.json({
-    status: 'XeerHub API running'
-  });
-});
+// Lightweight post-hoc check: flags (does not block) if the model's
+// answer cites an article number that isn't among the retrieved rows.
+// An 8B model's citation habits vary in format, so this is a warning
+// signal for you to review, not a hard filter.
+function checkCitationDrift(answerText, fused) {
+  const retrievedNumbers = new Set(fused.flatMap(l => extractNumbers(l.article_number)));
+  const mentioned = [...answerText.matchAll(/art(?:icle)?\.?\s*(\d+(?:-\d+)?)/gi)].map(m => m[1]);
+  const unmatched = mentioned.filter(n => !retrievedNumbers.has(n));
+  return unmatched.length ? { drift: true, unmatched } : { drift: false };
+}
+
+const SYSTEM = `You are XeerHub, a Somali legal intelligence assistant.
+
+RULES:
+- Use ONLY the provided laws.
+- Never invent facts or article numbers not present in the provided context.
+- Always cite law name and article number exactly as given in the context.
+- Be concise, structured, and accurate.
+- If context is insufficient, say so clearly.
+- Write in plain English for lawyers, NGOs, and business professionals.`;
+
+const INSUFFICIENT_MSG =
+  "XeerHub's verified sources don't clearly cover this question yet. Try rephrasing, or browse the Q&A library for related topics.";
 
 /* ─────────────────────────────────────────────
-   ASK ENDPOINT
+   ROUTES
 ───────────────────────────────────────────── */
+app.get('/', (req, res) => res.json({ status: 'XeerHub API running' }));
+
 app.get('/ask', async (req, res) => {
-
-  // Warmup
-  if (req.query.warmup === '1') {
-    return res.json({
-      status: 'warm',
-      ok: true
-    });
-  }
+  if (req.query.warmup === '1') return res.json({ status: 'warm', ok: true, modelLoaded: !!embedder });
 
   const question = req.query.q?.trim();
-  const lawArea  = req.query.law?.trim() || 'General';
-  const debug    = req.query.debug === '1';
-  const trace    = debug ? [] : null;
+  const lawArea = req.query.law?.trim() || 'General';
+  const debug = req.query.debug === '1';
+  const trace = debug ? [] : null;
 
-  if (!question) {
-    return res.status(400).json({
-      error: 'Missing question'
-    });
-  }
+  if (!question) return res.status(400).json({ error: 'Missing question' });
 
-  // Cache key includes lawArea so different law filters don't share cached results
-  const cacheKey = `${lawArea}::${question}`;
+  const cacheKey = `v2::${lawArea}::${question}`;
+  if (!debug && cache.has(cacheKey)) return res.json(cache.get(cacheKey));
 
-  // Cache hit (skip cache entirely in debug mode so trace is always fresh)
-  if (!debug && cache.has(cacheKey)) {
-    return res.json(cache.get(cacheKey));
-  }
-
-  /* ══════════════════════════════════════════
-     DEBUG PATH — returns raw retrieval trace,
-     never calls Groq. Use to diagnose empty
-     answers: /ask?q=...&law=...&debug=1
-  ══════════════════════════════════════════ */
   if (debug) {
     try {
-      const retrieved = await retrieve(question, lawArea, trace);
+      const { fused, gate: gateState } = await retrieve(question, lawArea, trace);
       return res.json({
-        question,
-        lawArea,
+        question, lawArea,
         resolvedLawName: LAW_NAME_MAP[lawArea] || null,
+        modelLoaded: !!embedder,
         trace,
-        laws: retrieved.laws,
+        gate: gateState,
+        fused: fused.map(f => ({ id: f.id, law_name: f.law_name, article_number: f.article_number, title: f.title, score: f._score, hitBy: f._hitBy })),
       });
     } catch (err) {
       trace.push({ step: 'error', message: err.message, stack: err.stack });
@@ -264,153 +369,96 @@ app.get('/ask', async (req, res) => {
     }
   }
 
-  /* ══════════════════════════════════════════
-     STREAMING PATH
-  ══════════════════════════════════════════ */
   if (req.query.stream === '1') {
-
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
-
-    const send = (event, data) => {
-      try {
-        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-      } catch (_) {}
-    };
+    const send = (event, data) => { try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (_) {} };
 
     try {
+      send('status', { msg: 'Searching Somali laws...' });
+      const { fused, gate: gateState } = await retrieve(question, lawArea);
 
-      send('status', {
-        msg: 'Searching Somali laws...'
-      });
-
-      const retrieved = await retrieve(question, lawArea);
-
-      const { laws } = retrieved;
-
-      send('citations', citationsFrom({ laws }));
-
-      if (!laws.length) {
-
-        send('answer_done', {
-          answer: "I couldn't find relevant legal content for that question in XeerHub's database. Try rephrasing your question."
-        });
-
+      if (gateState === 'none') {
+        send('citations', { laws: [], blogs: [] });
+        send('answer_done', { answer: INSUFFICIENT_MSG });
+        return res.end();
+      }
+      if (gateState === 'weak') {
+        send('citations', citationsFrom(fused));
+        send('answer_done', { answer: INSUFFICIENT_MSG + ' Closest matches are listed as citations below.' });
         return res.end();
       }
 
-      send('status', {
-        msg: 'Preparing answer...'
-      });
+      send('citations', citationsFrom(fused));
+      send('status', { msg: 'Preparing answer...' });
 
       const stream = await groq.chat.completions.create({
         model: 'llama-3.1-8b-instant',
         temperature: 0.1,
-        max_tokens: 400,
+        max_tokens: 500,
         stream: true,
         messages: [
-          {
-            role: 'system',
-            content: SYSTEM
-          },
-          {
-            role: 'user',
-            content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}`
-          }
-        ]
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext(fused)}` },
+        ],
       });
 
       let full = '';
-
       for await (const chunk of stream) {
-
         const token = chunk.choices[0]?.delta?.content || '';
-
-        if (token) {
-          full += token;
-          send('token', { token });
-        }
+        if (token) { full += token; send('token', { token }); }
       }
+      const drift = checkCitationDrift(full, fused);
+      if (drift.drift) console.warn('Citation drift detected:', question, drift.unmatched);
 
-      send('answer_done', {
-        answer: full
-      });
-
+      send('answer_done', { answer: full });
       res.end();
-
     } catch (err) {
-
       console.error('Stream error:', err);
-
-      try {
-        send('error', {
-          msg: err.message
-        });
-
-        res.end();
-      } catch (_) {}
+      try { send('error', { msg: err.message }); res.end(); } catch (_) {}
     }
-
     return;
   }
 
-  /* ══════════════════════════════════════════
-     JSON PATH
-  ══════════════════════════════════════════ */
+  // JSON path
   try {
+    const { fused, gate: gateState } = await retrieve(question, lawArea);
 
-    const { laws } = await retrieve(question, lawArea);
-
-    if (!laws.length) {
+    if (gateState === 'none') {
+      return res.json({ answer: INSUFFICIENT_MSG, citations: { laws: [], blogs: [] } });
+    }
+    if (gateState === 'weak') {
       return res.json({
-        answer: "I couldn't find relevant legal content for that question. Try rephrasing.",
-        citations: {
-          laws: [],
-          blogs: []
-        }
+        answer: INSUFFICIENT_MSG + ' Closest matches are listed as citations below.',
+        citations: citationsFrom(fused),
       });
     }
 
     const completion = await groq.chat.completions.create({
       model: 'llama-3.1-8b-instant',
       temperature: 0.1,
-      max_tokens: 400,
+      max_tokens: 500,
       messages: [
-        {
-          role: 'system',
-          content: SYSTEM
-        },
-        {
-          role: 'user',
-          content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext({ laws })}`
-        }
-      ]
+        { role: 'system', content: SYSTEM },
+        { role: 'user', content: `QUESTION: ${question}\n\nCONTEXT:\n${buildContext(fused)}` },
+      ],
     });
 
-    const responseData = {
-      answer: completion?.choices?.[0]?.message?.content?.trim() || 'No answer generated.',
-      citations: citationsFrom({ laws }),
-    };
+    const answer = completion?.choices?.[0]?.message?.content?.trim() || 'No answer generated.';
+    const drift = checkCitationDrift(answer, fused);
+    if (drift.drift) console.warn('Citation drift detected:', question, drift.unmatched);
 
+    const responseData = { answer, citations: citationsFrom(fused) };
     cache.set(cacheKey, responseData);
-
     return res.json(responseData);
-
   } catch (err) {
-
     console.error('Server Error:', err);
-
-    return res.status(500).json({
-      error: err.message || 'Internal server error'
-    });
+    return res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
 
-/* ─────────────────────────────────────────────
-   START SERVER
-───────────────────────────────────────────── */
 app.listen(PORT, () => {
   console.log(`XeerHub API running on port ${PORT}`);
 });
