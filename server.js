@@ -24,6 +24,19 @@ const PORT = process.env.PORT || 3000;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
+/* ─────────────────────────────────────────────
+   EMBEDDING MODEL — loaded once at boot.
+   In-process, so query vectors and the embedding_v2
+   document vectors come from the same pipeline —
+   this is required, not optional: embedding_hf
+   (produced by the HF hosted API) was confirmed to
+   NOT reproduce with this in-process model on the
+   same text (mean cos ~0.88), so mixing them would
+   silently produce wrong rankings.
+   If the model fails to load, the service degrades
+   to FTS + exact-match only and says so in responses
+   — it never fails silently.
+───────────────────────────────────────────── */
 let embedder = null;
 let embedderError = null;
 (async () => {
@@ -42,16 +55,26 @@ async function embedQuery(text) {
   return Array.from(out.data);
 }
 
+/* ─────────────────────────────────────────────
+   CACHE
+───────────────────────────────────────────── */
 const cache = new Map();
 
+/* ─────────────────────────────────────────────
+   LAW NAME MAP — must match the exact law_name
+   values in Supabase (confirmed via direct query).
+───────────────────────────────────────────── */
 const LAW_NAME_MAP = {
-  'Labor Law': 'Somalia Labour Code',
+  'Labor Law':              'Somalia Labour Code',
   'Foreign Investment Law': 'Foreign Investment Law',
-  'Income Tax Law': 'Income Tax Act 2025',
-  'Environmental Law': 'Environmental Law',
-  'Data Protection Law': 'Data Protection Law',
+  'Income Tax Law':         'Income Tax Act 2025',
+  'Environmental Law':      'Environmental Law',
+  'Data Protection Law':    'Data Protection Law',
 };
 
+/* ─────────────────────────────────────────────
+   QUERY NORMALIZATION
+───────────────────────────────────────────── */
 const STOPWORDS = new Set([
   'the','a','an','and','or','of','to','in','on','for','is','are','was','were',
   'be','been','being','my','your','their','his','her','its','our','do','does',
@@ -60,34 +83,9 @@ const STOPWORDS = new Set([
   'as','at','by','if','so','than','then','also','into','have','has','had',
 ]);
 
-// Explicit scope protection prevents generic vector similarities from treating
-// unrelated questions as weak legal matches.
-const OUT_OF_SCOPE_PATTERNS = [
-  /\bweather\b/i,
-  /\bpassport\b/i,
-  /\bdivorce\b/i,
-  /\bspeed limit\b/i,
-  /\btraffic\b/i,
-  /\bcapital gains tax\b.*\b(united states|usa|us)\b/i,
-  /\b(united states|usa|us)\b.*\bcapital gains tax\b/i,
-];
-
-const LEGAL_DOMAIN_PATTERNS = [
-  /\b(employer|employee|worker|salary|wage|wages|pay|paycheck|deduction|deductions|labou?r|maternity|dismiss|dismissal|terminate|termination|contract|working hours|payslip)\b/i,
-  /\b(investment|investor|invest|expropriation|nationali[sz]ation|foreign capital|profits out of Somalia)\b/i,
-  /\b(tax|taxable|taxation|tax resident|tax residence|rental income|withholding|presumptive)\b/i,
-  /\b(environment|environmental|charcoal|impact assessment|pollution|conservation)\b/i,
-  /\b(data protection|personal data|data breach|privacy|automated decision|controller|processor)\b/i,
-];
-
-function isOutOfScope(question) {
-  return OUT_OF_SCOPE_PATTERNS.some(pattern => pattern.test(question));
-}
-
-function hasLegalDomainHint(question) {
-  return LEGAL_DOMAIN_PATTERNS.some(pattern => pattern.test(question));
-}
-
+// Small curated glossary to bridge everyday phrasing to statutory vocabulary.
+// This does NOT replace semantic search — it's a cheap, auditable boost for
+// the FTS side specifically, where lexical overlap is everything.
 const SYNONYMS = {
   fire: ['terminate', 'dismiss', 'dismissal'],
   fired: ['terminated', 'dismissed'],
@@ -96,8 +94,6 @@ const SYNONYMS = {
   pay: ['wage', 'wages', 'remuneration'],
   paycheck: ['wage', 'wages'],
   cut: ['reduce', 'reduction', 'deduction', 'deductions'],
-  deduction: ['deductions', 'withholding', 'withhold'],
-  deductions: ['deduction', 'withholding', 'withhold'],
   quit: ['resign', 'resignation'],
   sick: ['illness', 'medical'],
   maternity: ['pregnancy', 'pregnant'],
@@ -111,7 +107,7 @@ function tokenize(question) {
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(w => w.length > 2 && !STOPWORDS.has(w))
-    .slice(0, 14);
+    .slice(0, 14); // generous cap — just a sanity limit, not a truncation bug
 }
 
 function expandWithSynonyms(words) {
@@ -122,15 +118,27 @@ function expandWithSynonyms(words) {
   return [...expanded];
 }
 
+// Detects an explicit article/regulation reference in the question, e.g.
+// "article 85", "art. 18", "regulation 9-1". Used for the exact-match
+// retriever — this is the one retriever that should behave like a lookup,
+// not a ranked search.
 function extractArticleRef(question) {
   const m = question.match(/\b(?:art(?:icle)?\.?|reg(?:ulation)?\.?)\s*(\d+(?:-\d+)?)/i);
   return m ? m[1] : null;
 }
 
+// Normalizes messy article_number formats ("Art. 6", "ITA 2025 · Art. 12",
+// "79, 84") down to the set of bare numbers they contain, for comparison.
 function extractNumbers(raw) {
   if (!raw) return [];
   return [...raw.matchAll(/\d+(?:-\d+)?/g)].map(m => m[0]);
 }
+
+/* ─────────────────────────────────────────────
+   RETRIEVERS
+   Each returns an array of { id, law_name, article_number, title, text, _rank }
+   in best-first order. Ranks are 0-indexed for RRF.
+───────────────────────────────────────────── */
 
 async function retrieveVector(question, lawName, trace) {
   if (!embedder) {
@@ -155,7 +163,7 @@ async function retrieveFTS(question, lawName, trace) {
   const words = tokenize(question);
   if (words.length === 0) {
     if (trace) trace.push({ step: 'fts', skipped: true, reason: 'no usable words' });
-    return [];
+    return { rows: [], mode: null, wordCount: 0 };
   }
   const expanded = expandWithSynonyms(words);
 
@@ -167,14 +175,16 @@ async function retrieveFTS(question, lawName, trace) {
     });
   }
 
+  // AND first (precise), OR fallback with synonym expansion (broad).
+  // `mode` is returned because it is a real relevance signal: an AND hit means
+  // every query term occurs in the same article; an OR hit only means "some word overlapped".
   let res = await run(words.join(' & '));
   if (trace) trace.push({ step: 'fts:AND', terms: words.join(' & '), resultCount: res.data?.length || 0, error: res.error?.message });
+  if (res.data && res.data.length > 0) return { rows: res.data, mode: 'and', wordCount: words.length };
 
-  if (!res.data || res.data.length === 0) {
-    res = await run(expanded.join(' | '));
-    if (trace) trace.push({ step: 'fts:OR', terms: expanded.join(' | '), resultCount: res.data?.length || 0, error: res.error?.message });
-  }
-  return res.data || [];
+  res = await run(expanded.join(' | '));
+  if (trace) trace.push({ step: 'fts:OR', terms: expanded.join(' | '), resultCount: res.data?.length || 0, error: res.error?.message });
+  return { rows: res.data || [], mode: res.data?.length ? 'or' : null, wordCount: words.length };
 }
 
 async function retrieveExact(question, lawName, trace) {
@@ -194,19 +204,28 @@ async function retrieveExact(question, lawName, trace) {
   return data || [];
 }
 
+/* ─────────────────────────────────────────────
+   FUSION (Reciprocal Rank Fusion) — ordering only.
+
+   RRF scores are rank-based: a single retriever's #1 hit is always
+   1/60 = 0.0167 no matter how irrelevant it is. They can order results
+   but they CANNOT say whether the results are relevant. The gate below
+   therefore uses absolute signals (exact match, vector cosine
+   similarity, FTS AND-vs-OR), never the RRF score.
+───────────────────────────────────────────── */
 const RRF_K = 60;
 const EXACT_MATCH_BOOST = 1.0;
 
 function fuse({ vectorResults, ftsResults, exactResults }) {
-  const scores = new Map();
+  const scores = new Map(); // id -> { row, score, hitBy: Set, sim }
 
   function addList(list, label) {
     list.forEach((row, rank) => {
-      const key = row.id;
-      const entry = scores.get(key) || { row, score: 0, hitBy: new Set() };
+      const entry = scores.get(row.id) || { row, score: 0, hitBy: new Set(), sim: null };
       entry.score += 1 / (RRF_K + rank);
       entry.hitBy.add(label);
-      scores.set(key, entry);
+      if (label === 'vector' && typeof row.similarity === 'number') entry.sim = row.similarity;
+      scores.set(row.id, entry);
     });
   }
 
@@ -214,52 +233,81 @@ function fuse({ vectorResults, ftsResults, exactResults }) {
   addList(ftsResults, 'fts');
 
   exactResults.forEach(row => {
-    const key = row.id;
-    const entry = scores.get(key) || { row, score: 0, hitBy: new Set() };
+    const entry = scores.get(row.id) || { row, score: 0, hitBy: new Set(), sim: null };
     entry.score += EXACT_MATCH_BOOST;
     entry.hitBy.add('exact');
-    scores.set(key, entry);
+    scores.set(row.id, entry);
   });
 
   return [...scores.values()]
     .sort((a, b) => b.score - a.score)
-    .map(e => ({ ...e.row, _score: e.score, _hitBy: [...e.hitBy] }));
+    .map(e => ({ ...e.row, _score: e.score, _hitBy: [...e.hitBy], _sim: e.sim }));
 }
 
-function gate(fused) {
-  if (fused.length === 0) return { state: 'none', top: null };
+/* Gate thresholds. Cosine similarity for MiniLM question-vs-article is
+   typically 0.3–0.6, so these are PROVISIONAL starting points — calibrate
+   from `node bench/run.js` (it prints the vecTop distribution for in-scope
+   vs out-of-scope questions) and override via env without redeploying code. */
+const VEC_SUPPORTED = parseFloat(process.env.VEC_SUPPORTED || '0.50');
+const VEC_WEAK      = parseFloat(process.env.VEC_WEAK || '0.35');
+
+// Three-state gate. "supported" calls Groq; "weak" and "none" never do.
+function gate(fused, signals) {
+  if (fused.length === 0) return { state: 'none', reason: 'nothing retrieved' };
+
+  const { exact, vecTop, ftsMode, ftsWordCount, vectorAvailable } = signals;
   const top = fused[0];
-  const multiRetriever = top._hitBy.length >= 2;
-  const hasExact = top._hitBy.includes('exact');
-  if (hasExact || multiRetriever || top._score >= 0.03) return { state: 'supported', top };
-  if (top._score >= 0.012) return { state: 'weak', top };
-  return { state: 'none', top };
+
+  if (exact) return { state: 'supported', reason: 'explicit article reference' };
+
+  if (vecTop !== null && vecTop >= VEC_SUPPORTED)
+    return { state: 'supported', reason: `vector similarity ${vecTop.toFixed(3)} >= ${VEC_SUPPORTED}` };
+
+  // Every query term co-occurs in the top article, and it is the FTS #1 hit.
+  // Needs >= 2 terms so a single generic word cannot pass on its own.
+  if (ftsMode === 'and' && ftsWordCount >= 2 && top._hitBy.includes('fts'))
+    return { state: 'supported', reason: 'FTS AND match (all query terms present)' };
+
+  if (vecTop !== null && vecTop >= VEC_WEAK)
+    return { state: 'weak', reason: `vector similarity ${vecTop.toFixed(3)} in weak band` };
+
+  // Vector is down/empty: OR-only lexical overlap is all we have. Say "weak"
+  // rather than "none" so a real question is not discarded just because the
+  // vector path failed — but the trace/`vectorAvailable:false` makes that visible.
+  if (!vectorAvailable && ftsMode === 'or')
+    return { state: 'weak', reason: 'vector unavailable; OR-only lexical overlap' };
+
+  return { state: 'none', reason: 'no strong lexical or semantic signal' };
 }
 
 async function retrieve(question, lawArea, trace) {
-  if (isOutOfScope(question) || !hasLegalDomainHint(question)) {
-    if (trace) trace.push({
-      step: 'scope',
-      gate: 'none',
-      reason: isOutOfScope(question)
-        ? 'explicitly out-of-scope question'
-        : 'no supported legal-domain keyword detected',
-    });
-    return { fused: [], gate: 'none' };
-  }
-
   const lawName = LAW_NAME_MAP[lawArea] || null;
-  const [vectorResults, ftsResults, exactResults] = await Promise.all([
+  const [vectorResults, fts, exactResults] = await Promise.all([
     retrieveVector(question, lawName, trace),
     retrieveFTS(question, lawName, trace),
     retrieveExact(question, lawName, trace),
   ]);
-  const fused = fuse({ vectorResults, ftsResults, exactResults });
-  const gateResult = gate(fused);
-  if (trace) trace.push({ step: 'fuse', fusedCount: fused.length, gate: gateResult.state, topScore: fused[0]?._score });
-  return { fused: fused.slice(0, 5), gate: gateResult.state };
+  const fused = fuse({ vectorResults, ftsResults: fts.rows, exactResults });
+  const signals = {
+    exact: exactResults.length > 0,
+    vectorAvailable: vectorResults.length > 0,
+    vectorCount: vectorResults.length,
+    vecTop: vectorResults.length ? (vectorResults[0].similarity ?? null) : null,
+    ftsMode: fts.mode,
+    ftsWordCount: fts.wordCount,
+    ftsCount: fts.rows.length,
+  };
+  const g = gate(fused, signals);
+  if (trace) trace.push({ step: 'fuse', fusedCount: fused.length, gate: g.state, gateReason: g.reason, signals });
+  return { fused: fused.slice(0, 5), gate: g.state, gateReason: g.reason, signals };
 }
 
+/* ─────────────────────────────────────────────
+   CONTEXT + CITATIONS
+   Citations are built ONLY from fused `laws` rows —
+   never from qa_library (0% verified — see project
+   notes) and never invented by the model.
+───────────────────────────────────────────── */
 function buildContext(fused) {
   return [
     '==================== LAWS ====================',
@@ -281,13 +329,17 @@ function citationsFrom(fused) {
       law: l.law_name,
       article: cleanArticleNumber(l.article_number),
       title: l.title,
-      similarity: l._score,
+      similarity: l._sim, // cosine similarity (null if not found by vector) — RRF score is rank-only and not meaningful to show
       matchedBy: l._hitBy,
     })),
     blogs: [],
   };
 }
 
+// Lightweight post-hoc check: flags (does not block) if the model's
+// answer cites an article number that isn't among the retrieved rows.
+// An 8B model's citation habits vary in format, so this is a warning
+// signal for you to review, not a hard filter.
 function checkCitationDrift(answerText, fused) {
   const retrievedNumbers = new Set(fused.flatMap(l => extractNumbers(l.article_number)));
   const mentioned = [...answerText.matchAll(/art(?:icle)?\.?\s*(\d+(?:-\d+)?)/gi)].map(m => m[1]);
@@ -308,6 +360,9 @@ RULES:
 const INSUFFICIENT_MSG =
   "XeerHub's verified sources don't clearly cover this question yet. Try rephrasing, or browse the Q&A library for related topics.";
 
+/* ─────────────────────────────────────────────
+   ROUTES
+───────────────────────────────────────────── */
 app.get('/', (req, res) => res.json({ status: 'XeerHub API running' }));
 
 app.get('/ask', async (req, res) => {
@@ -325,14 +380,17 @@ app.get('/ask', async (req, res) => {
 
   if (debug) {
     try {
-      const { fused, gate: gateState } = await retrieve(question, lawArea, trace);
+      const { fused, gate: gateState, gateReason, signals } = await retrieve(question, lawArea, trace);
       return res.json({
         question, lawArea,
         resolvedLawName: LAW_NAME_MAP[lawArea] || null,
         modelLoaded: !!embedder,
         trace,
         gate: gateState,
-        fused: fused.map(f => ({ id: f.id, law_name: f.law_name, article_number: f.article_number, title: f.title, score: f._score, hitBy: f._hitBy })),
+        gateReason,
+        signals,
+        thresholds: { VEC_SUPPORTED, VEC_WEAK },
+        fused: fused.map(f => ({ id: f.id, law_name: f.law_name, article_number: f.article_number, title: f.title, score: f._score, similarity: f._sim, hitBy: f._hitBy })),
       });
     } catch (err) {
       trace.push({ step: 'error', message: err.message, stack: err.stack });
@@ -393,6 +451,7 @@ app.get('/ask', async (req, res) => {
     return;
   }
 
+  // JSON path
   try {
     const { fused, gate: gateState } = await retrieve(question, lawArea);
 
