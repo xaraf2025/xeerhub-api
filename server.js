@@ -4,6 +4,7 @@ import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import Groq from 'groq-sdk';
 import { pipeline } from '@huggingface/transformers';
+import crypto from 'node:crypto';
 
 const requiredEnv = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'GROQ_API_KEY'];
 for (const key of requiredEnv) {
@@ -14,6 +15,7 @@ for (const key of requiredEnv) {
 }
 
 const app = express();
+app.set('trust proxy', 1); // Railway sits behind a proxy; needed for the real client IP (rate limiting)
 app.use(cors({
   origin: ['https://xeerhub.com', 'https://www.xeerhub.com', 'http://localhost:3000'],
 }));
@@ -486,6 +488,69 @@ app.get('/ask', async (req, res) => {
     console.error('Server Error:', err);
     return res.status(500).json({ error: err.message || 'Internal server error' });
   }
+});
+
+/* ─────────────────────────────────────────────
+   SUGGEST A QUESTION  (POST /suggest)
+   Frontend form sends { question, lawArea, email, website }.
+   `website` is a honeypot: real users leave it empty, bots fill it.
+   Stored in public.question_suggestions (see suggest-table.sql).
+───────────────────────────────────────────── */
+const SUGGEST_AREAS = new Set(['General', ...Object.keys(LAW_NAME_MAP)]);
+const suggestHits = new Map(); // ip -> [timestamps]
+const SUGGEST_LIMIT = 5;                 // per IP
+const SUGGEST_WINDOW_MS = 60 * 60 * 1000; // per hour
+
+function suggestRateLimited(ip) {
+  const now = Date.now();
+  const recent = (suggestHits.get(ip) || []).filter(t => now - t < SUGGEST_WINDOW_MS);
+  if (recent.length >= SUGGEST_LIMIT) { suggestHits.set(ip, recent); return true; }
+  recent.push(now);
+  suggestHits.set(ip, recent);
+  return false;
+}
+setInterval(() => { // keep the map from growing forever
+  const now = Date.now();
+  for (const [ip, ts] of suggestHits) {
+    const recent = ts.filter(t => now - t < SUGGEST_WINDOW_MS);
+    if (recent.length) suggestHits.set(ip, recent); else suggestHits.delete(ip);
+  }
+}, 10 * 60 * 1000).unref();
+
+app.post('/suggest', async (req, res) => {
+  const body = req.body || {};
+  const question = typeof body.question === 'string' ? body.question.trim() : '';
+  const email = typeof body.email === 'string' ? body.email.trim() : '';
+  const lawArea = typeof body.lawArea === 'string' ? body.lawArea.trim() : 'General';
+  const website = typeof body.website === 'string' ? body.website.trim() : '';
+
+  // Honeypot: pretend success so bots learn nothing, but store nothing.
+  if (website) return res.json({ ok: true });
+
+  if (question.length < 10) return res.status(400).json({ error: 'Please write your question (at least 10 characters).' });
+  if (question.length > 500) return res.status(400).json({ error: 'Question is too long (max 500 characters).' });
+  if (email && (email.length > 200 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)))
+    return res.status(400).json({ error: 'Please enter a valid email or leave it blank.' });
+  if (!SUGGEST_AREAS.has(lawArea)) return res.status(400).json({ error: 'Unknown law area.' });
+
+  const ip = req.ip || 'unknown';
+  if (suggestRateLimited(ip)) return res.status(429).json({ error: 'Too many suggestions from your connection. Please try again later.' });
+
+  // Store a salted hash of the IP (enough to spot spam, no raw IP kept).
+  const ipHash = crypto.createHash('sha256').update(ip + (process.env.SUGGEST_SALT || '')).digest('hex').slice(0, 32);
+
+  const { error } = await supabase.from('question_suggestions').insert({
+    question,
+    law_area: lawArea,
+    email: email || null,
+    ip_hash: ipHash,
+    user_agent: (req.get('user-agent') || '').slice(0, 300),
+  });
+  if (error) {
+    console.error('Suggest insert error:', error.message);
+    return res.status(500).json({ error: 'Could not save your suggestion. Please try again, or email info@xeerhub.com.' });
+  }
+  return res.json({ ok: true });
 });
 
 app.listen(PORT, () => {
