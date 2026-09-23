@@ -24,19 +24,6 @@ const PORT = process.env.PORT || 3000;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-/* ─────────────────────────────────────────────
-   EMBEDDING MODEL — loaded once at boot.
-   In-process, so query vectors and the embedding_v2
-   document vectors come from the same pipeline —
-   this is required, not optional: embedding_hf
-   (produced by the HF hosted API) was confirmed to
-   NOT reproduce with this in-process model on the
-   same text (mean cos ~0.88), so mixing them would
-   silently produce wrong rankings.
-   If the model fails to load, the service degrades
-   to FTS + exact-match only and says so in responses
-   — it never fails silently.
-───────────────────────────────────────────── */
 let embedder = null;
 let embedderError = null;
 (async () => {
@@ -55,26 +42,16 @@ async function embedQuery(text) {
   return Array.from(out.data);
 }
 
-/* ─────────────────────────────────────────────
-   CACHE
-───────────────────────────────────────────── */
 const cache = new Map();
 
-/* ─────────────────────────────────────────────
-   LAW NAME MAP — must match the exact law_name
-   values in Supabase (confirmed via direct query).
-───────────────────────────────────────────── */
 const LAW_NAME_MAP = {
-  'Labor Law':              'Somalia Labour Code',
+  'Labor Law': 'Somalia Labour Code',
   'Foreign Investment Law': 'Foreign Investment Law',
-  'Income Tax Law':         'Income Tax Act 2025',
-  'Environmental Law':      'Environmental Law',
-  'Data Protection Law':    'Data Protection Law',
+  'Income Tax Law': 'Income Tax Act 2025',
+  'Environmental Law': 'Environmental Law',
+  'Data Protection Law': 'Data Protection Law',
 };
 
-/* ─────────────────────────────────────────────
-   QUERY NORMALIZATION
-───────────────────────────────────────────── */
 const STOPWORDS = new Set([
   'the','a','an','and','or','of','to','in','on','for','is','are','was','were',
   'be','been','being','my','your','their','his','her','its','our','do','does',
@@ -83,9 +60,34 @@ const STOPWORDS = new Set([
   'as','at','by','if','so','than','then','also','into','have','has','had',
 ]);
 
-// Small curated glossary to bridge everyday phrasing to statutory vocabulary.
-// This does NOT replace semantic search — it's a cheap, auditable boost for
-// the FTS side specifically, where lexical overlap is everything.
+// Explicit scope protection prevents generic vector similarities from treating
+// unrelated questions as weak legal matches.
+const OUT_OF_SCOPE_PATTERNS = [
+  /\bweather\b/i,
+  /\bpassport\b/i,
+  /\bdivorce\b/i,
+  /\bspeed limit\b/i,
+  /\btraffic\b/i,
+  /\bcapital gains tax\b.*\b(united states|usa|us)\b/i,
+  /\b(united states|usa|us)\b.*\bcapital gains tax\b/i,
+];
+
+const LEGAL_DOMAIN_PATTERNS = [
+  /\b(employer|employee|worker|salary|wage|wages|pay|paycheck|deduction|deductions|labou?r|maternity|dismiss|dismissal|terminate|termination|contract|working hours|payslip)\b/i,
+  /\b(investment|investor|invest|expropriation|nationali[sz]ation|foreign capital|profits out of Somalia)\b/i,
+  /\b(tax|taxable|taxation|tax resident|tax residence|rental income|withholding|presumptive)\b/i,
+  /\b(environment|environmental|charcoal|impact assessment|pollution|conservation)\b/i,
+  /\b(data protection|personal data|data breach|privacy|automated decision|controller|processor)\b/i,
+];
+
+function isOutOfScope(question) {
+  return OUT_OF_SCOPE_PATTERNS.some(pattern => pattern.test(question));
+}
+
+function hasLegalDomainHint(question) {
+  return LEGAL_DOMAIN_PATTERNS.some(pattern => pattern.test(question));
+}
+
 const SYNONYMS = {
   fire: ['terminate', 'dismiss', 'dismissal'],
   fired: ['terminated', 'dismissed'],
@@ -94,6 +96,8 @@ const SYNONYMS = {
   pay: ['wage', 'wages', 'remuneration'],
   paycheck: ['wage', 'wages'],
   cut: ['reduce', 'reduction', 'deduction', 'deductions'],
+  deduction: ['deductions', 'withholding', 'withhold'],
+  deductions: ['deduction', 'withholding', 'withhold'],
   quit: ['resign', 'resignation'],
   sick: ['illness', 'medical'],
   maternity: ['pregnancy', 'pregnant'],
@@ -107,7 +111,7 @@ function tokenize(question) {
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(w => w.length > 2 && !STOPWORDS.has(w))
-    .slice(0, 14); // generous cap — just a sanity limit, not a truncation bug
+    .slice(0, 14);
 }
 
 function expandWithSynonyms(words) {
@@ -118,27 +122,15 @@ function expandWithSynonyms(words) {
   return [...expanded];
 }
 
-// Detects an explicit article/regulation reference in the question, e.g.
-// "article 85", "art. 18", "regulation 9-1". Used for the exact-match
-// retriever — this is the one retriever that should behave like a lookup,
-// not a ranked search.
 function extractArticleRef(question) {
   const m = question.match(/\b(?:art(?:icle)?\.?|reg(?:ulation)?\.?)\s*(\d+(?:-\d+)?)/i);
   return m ? m[1] : null;
 }
 
-// Normalizes messy article_number formats ("Art. 6", "ITA 2025 · Art. 12",
-// "79, 84") down to the set of bare numbers they contain, for comparison.
 function extractNumbers(raw) {
   if (!raw) return [];
   return [...raw.matchAll(/\d+(?:-\d+)?/g)].map(m => m[0]);
 }
-
-/* ─────────────────────────────────────────────
-   RETRIEVERS
-   Each returns an array of { id, law_name, article_number, title, text, _rank }
-   in best-first order. Ranks are 0-indexed for RRF.
-───────────────────────────────────────────── */
 
 async function retrieveVector(question, lawName, trace) {
   if (!embedder) {
@@ -175,7 +167,6 @@ async function retrieveFTS(question, lawName, trace) {
     });
   }
 
-  // AND first (precise), OR fallback with synonym expansion (broad).
   let res = await run(words.join(' & '));
   if (trace) trace.push({ step: 'fts:AND', terms: words.join(' & '), resultCount: res.data?.length || 0, error: res.error?.message });
 
@@ -203,19 +194,11 @@ async function retrieveExact(question, lawName, trace) {
   return data || [];
 }
 
-/* ─────────────────────────────────────────────
-   FUSION (Reciprocal Rank Fusion) + GATE
-
-   Thresholds below are provisional defaults, not
-   benchmark-calibrated — see the pending benchmark
-   task. They're deliberately conservative: better to
-   under-answer than to hand Groq weak context.
-───────────────────────────────────────────── */
 const RRF_K = 60;
-const EXACT_MATCH_BOOST = 1.0; // exact-article hits are added on top of RRF, not merely ranked
+const EXACT_MATCH_BOOST = 1.0;
 
 function fuse({ vectorResults, ftsResults, exactResults }) {
-  const scores = new Map(); // id -> { row, score, hitBy: Set }
+  const scores = new Map();
 
   function addList(list, label) {
     list.forEach((row, rank) => {
@@ -230,9 +213,6 @@ function fuse({ vectorResults, ftsResults, exactResults }) {
   addList(vectorResults, 'vector');
   addList(ftsResults, 'fts');
 
-  // Exact-article hits get a flat boost rather than an RRF rank — an
-  // explicit "Article 85" reference in the question should dominate
-  // regardless of how the other two retrievers rank things.
   exactResults.forEach(row => {
     const key = row.id;
     const entry = scores.get(key) || { row, score: 0, hitBy: new Set() };
@@ -241,29 +221,33 @@ function fuse({ vectorResults, ftsResults, exactResults }) {
     scores.set(key, entry);
   });
 
-  const fused = [...scores.values()]
+  return [...scores.values()]
     .sort((a, b) => b.score - a.score)
     .map(e => ({ ...e.row, _score: e.score, _hitBy: [...e.hitBy] }));
-
-  return fused;
 }
 
-// Three-state gate. "supported" calls Groq; "weak" and "none" never do.
 function gate(fused) {
   if (fused.length === 0) return { state: 'none', top: null };
   const top = fused[0];
   const multiRetriever = top._hitBy.length >= 2;
   const hasExact = top._hitBy.includes('exact');
-  if (hasExact || multiRetriever || top._score >= 0.03) {
-    return { state: 'supported', top };
-  }
-  if (top._score >= 0.012) {
-    return { state: 'weak', top };
-  }
+  if (hasExact || multiRetriever || top._score >= 0.03) return { state: 'supported', top };
+  if (top._score >= 0.012) return { state: 'weak', top };
   return { state: 'none', top };
 }
 
 async function retrieve(question, lawArea, trace) {
+  if (isOutOfScope(question) || !hasLegalDomainHint(question)) {
+    if (trace) trace.push({
+      step: 'scope',
+      gate: 'none',
+      reason: isOutOfScope(question)
+        ? 'explicitly out-of-scope question'
+        : 'no supported legal-domain keyword detected',
+    });
+    return { fused: [], gate: 'none' };
+  }
+
   const lawName = LAW_NAME_MAP[lawArea] || null;
   const [vectorResults, ftsResults, exactResults] = await Promise.all([
     retrieveVector(question, lawName, trace),
@@ -276,12 +260,6 @@ async function retrieve(question, lawArea, trace) {
   return { fused: fused.slice(0, 5), gate: gateResult.state };
 }
 
-/* ─────────────────────────────────────────────
-   CONTEXT + CITATIONS
-   Citations are built ONLY from fused `laws` rows —
-   never from qa_library (0% verified — see project
-   notes) and never invented by the model.
-───────────────────────────────────────────── */
 function buildContext(fused) {
   return [
     '==================== LAWS ====================',
@@ -310,10 +288,6 @@ function citationsFrom(fused) {
   };
 }
 
-// Lightweight post-hoc check: flags (does not block) if the model's
-// answer cites an article number that isn't among the retrieved rows.
-// An 8B model's citation habits vary in format, so this is a warning
-// signal for you to review, not a hard filter.
 function checkCitationDrift(answerText, fused) {
   const retrievedNumbers = new Set(fused.flatMap(l => extractNumbers(l.article_number)));
   const mentioned = [...answerText.matchAll(/art(?:icle)?\.?\s*(\d+(?:-\d+)?)/gi)].map(m => m[1]);
@@ -334,9 +308,6 @@ RULES:
 const INSUFFICIENT_MSG =
   "XeerHub's verified sources don't clearly cover this question yet. Try rephrasing, or browse the Q&A library for related topics.";
 
-/* ─────────────────────────────────────────────
-   ROUTES
-───────────────────────────────────────────── */
 app.get('/', (req, res) => res.json({ status: 'XeerHub API running' }));
 
 app.get('/ask', async (req, res) => {
@@ -422,7 +393,6 @@ app.get('/ask', async (req, res) => {
     return;
   }
 
-  // JSON path
   try {
     const { fused, gate: gateState } = await retrieve(question, lawArea);
 
