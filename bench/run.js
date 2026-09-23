@@ -10,15 +10,32 @@ import fs from 'fs';
 const API_BASE = process.argv[2] || 'https://xeerhub-api-production.up.railway.app';
 const questions = JSON.parse(fs.readFileSync(new URL('./questions.json', import.meta.url)));
 
+// Expands "62-63" / "57–58" into 62,63 / 57,58 and keeps regulation-style
+// tokens like "9-1" (where the second number is smaller) as-is.
 function extractNumbers(raw) {
   if (!raw) return [];
-  return [...raw.matchAll(/\d+(?:-\d+)?/g)].map(m => m[0]);
+  const out = new Set();
+  for (const m of raw.matchAll(/(\d+)(?:\s*[-–]\s*(\d+))?/g)) {
+    const a = parseInt(m[1], 10);
+    out.add(m[1]);
+    if (m[2]) {
+      const b = parseInt(m[2], 10);
+      out.add(`${m[1]}-${m[2]}`);
+      if (b > a && b - a <= 20) for (let n = a; n <= b; n++) out.add(String(n));
+    }
+  }
+  return [...out];
 }
 
-function matchesExpected(articleNumberRaw, expectedArticles) {
-  const nums = extractNumbers(articleNumberRaw);
-  return expectedArticles.some(e => nums.includes(e));
+// A hit needs the right LAW as well as the right article number — otherwise
+// e.g. Income Tax "Arts. 16, 17, 18, 19" would count as a hit for Foreign Investment Art. 18.
+function matchesExpected(row, tc) {
+  if (tc.expectedLaw && row.law_name !== tc.expectedLaw) return false;
+  const nums = extractNumbers(row.article_number);
+  return tc.expectedArticles.some(e => nums.includes(e));
 }
+
+const fmt = f => `${f.law_name} · ${f.article_number} (rrf ${f.score?.toFixed(4)}${typeof f.similarity === 'number' ? ', cos ' + f.similarity.toFixed(3) : ''}; ${(f.hitBy || []).join('+')})`;
 
 async function runOne(tc) {
   const url = `${API_BASE}/ask?q=${encodeURIComponent(tc.question)}&debug=1`;
@@ -45,18 +62,22 @@ async function runOne(tc) {
   const modelLoaded = body.modelLoaded;
 
   if (tc.outOfScope) {
-    const pass = gate === 'none';
+    // "weak" never calls Groq (the user sees the 'sources don't clearly cover this'
+    // message), so for out-of-scope questions the real failure is gate=supported.
+    // strictNone is tracked separately for calibration.
+    const pass = gate !== 'supported';
+    const strictNone = gate === 'none';
     return {
       id: tc.id, question: tc.question, expectedLaw: null, expectedArticles: [],
-      retrieved: fused.map(f => `${f.law_name} · ${f.article_number}`),
-      gate, gateReason, signals, modelLoaded, pass,
-      reason: pass ? 'correctly returned no match' : `expected gate=none but got gate=${gate} (${gateReason})`,
+      retrieved: fused.map(fmt),
+      gate, gateReason, signals, modelLoaded, pass, strictNone,
+      reason: pass ? (strictNone ? 'correctly returned no match' : 'not answered (gate=weak)') : `out-of-scope question was ANSWERED (gate=supported: ${gateReason})`,
     };
   }
 
   let hitRank = -1;
   fused.forEach((f, i) => {
-    if (hitRank === -1 && matchesExpected(f.article_number, tc.expectedArticles)) hitRank = i;
+    if (hitRank === -1 && matchesExpected(f, tc)) hitRank = i;
   });
 
   const hit1 = hitRank === 0;
@@ -73,7 +94,7 @@ async function runOne(tc) {
   return {
     id: tc.id, cluster: tc.cluster || null, question: tc.question,
     expectedLaw: tc.expectedLaw, expectedArticles: tc.expectedArticles,
-    retrieved: fused.map(f => `${f.law_name} · ${f.article_number} (rrf ${f.score?.toFixed(4)}${typeof f.similarity === 'number' ? ', cos ' + f.similarity.toFixed(3) : ''}; ${(f.hitBy || []).join('+')})`),
+    retrieved: fused.map(fmt),
     gate, gateReason, signals, modelLoaded, hitRank, hit1, hit3, mrr, pass, reason,
   };
 }
@@ -95,13 +116,14 @@ async function main() {
   const hit3Rate = inScope.filter(r => r.hit3).length / inScope.length;
   const mrrAvg = inScope.reduce((s, r) => s + (r.mrr || 0), 0) / inScope.length;
   const oosPassRate = oos.filter(r => r.pass).length / oos.length;
+  const oosStrictRate = oos.filter(r => r.strictNone).length / oos.length;
 
   console.log('\n──────────── SUMMARY ────────────');
   console.log(`In-scope questions : ${inScope.length}`);
   console.log(`hit@1              : ${(hit1Rate * 100).toFixed(1)}%`);
   console.log(`hit@3              : ${(hit3Rate * 100).toFixed(1)}%`);
   console.log(`MRR                : ${mrrAvg.toFixed(3)}`);
-  console.log(`Out-of-scope guard : ${(oosPassRate * 100).toFixed(1)}% correctly returned no match (${oos.length} cases)`);
+  console.log(`Out-of-scope guard : ${(oosPassRate * 100).toFixed(1)}% not answered (${oos.length} cases)  |  strict gate=none: ${(oosStrictRate * 100).toFixed(1)}%`);
 
   // ── Signal diagnostics: is the vector path alive, and where do the similarities sit?
   const vecDead = results.filter(r => r.signals && r.signals.vectorAvailable === false).length;
@@ -137,7 +159,7 @@ async function main() {
 
   fs.writeFileSync(
     new URL('./results.json', import.meta.url),
-    JSON.stringify({ summary: { hit1Rate, hit3Rate, mrrAvg, oosPassRate }, results }, null, 2)
+    JSON.stringify({ summary: { hit1Rate, hit3Rate, mrrAvg, oosPassRate, oosStrictRate }, results }, null, 2)
   );
   console.log('\nFull results written to bench/results.json');
 }
