@@ -1,0 +1,856 @@
+{
+  "summary": {
+    "hit1Rate": 0.6,
+    "hit3Rate": 0.7714285714285715,
+    "mrrAvg": 0.6961904761904762,
+    "oosPassRate": 0
+  },
+  "results": [
+    {
+      "id": "ded-1",
+      "cluster": "salary-deductions",
+      "question": "Can an employer make deductions from a worker salary?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "85"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 85 (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "ded-2",
+      "cluster": "salary-deductions",
+      "question": "Is my boss allowed to take money from my wages?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "85"
+      ],
+      "retrieved": [
+        "Income Tax Act 2025 · ITR 2025 · Regs. 90-1, 90-2, 105-8 (score 0.0167)",
+        "Somalia Labour Code · 48, 49 (score 0.0164)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 12 (score 0.0161)",
+        "Somalia Labour Code ·  73, 79 (score 0.0159)",
+        "Somalia Labour Code · 76 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": -1,
+      "hit1": false,
+      "hit3": false,
+      "mrr": 0,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "ded-3",
+      "cluster": "salary-deductions",
+      "question": "Can an employer reduce an employee's pay?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "85"
+      ],
+      "retrieved": [
+        "Somalia Labour Code ·  73, 85 (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "ded-4",
+      "cluster": "salary-deductions",
+      "question": "When can salary deductions be made?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "85"
+      ],
+      "retrieved": [
+        "Income Tax Act 2025 · ITA 2025 · Art. 76 (score 0.0167)",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 16, 17, 18, 19 (score 0.0164)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 16 (score 0.0161)",
+        "Somalia Labour Code · 85 (score 0.0159)",
+        "Somalia Labour Code · 76 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 3,
+      "hit1": false,
+      "hit3": false,
+      "mrr": 0.25,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "ded-5",
+      "cluster": "salary-deductions",
+      "question": "What does Somali labour law say about wage deductions?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "85"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 7 (score 0.0167)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 16 (score 0.0164)",
+        "Foreign Investment Law · Art. 20 (score 0.0161)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 76 (score 0.0159)",
+        "Somalia Labour Code · 85 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 4,
+      "hit1": false,
+      "hit3": false,
+      "mrr": 0.2,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "term-1",
+      "cluster": "termination-without-reason",
+      "question": "Can I fire someone without giving a reason?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "111",
+        "109"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 109, 111 (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "term-2",
+      "cluster": "termination-without-reason",
+      "question": "Is it legal to dismiss an employee with no cause?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "111",
+        "109"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 3 (score 0.0167)",
+        "Somalia Labour Code · 103 (score 0.0164)",
+        "Somalia Labour Code ·  68, 70, 111 (score 0.0161)",
+        "Somalia Labour Code ·  108, 111, 112 (score 0.0159)",
+        "Somalia Labour Code · 117, 129 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 2,
+      "hit1": false,
+      "hit3": true,
+      "mrr": 0.3333333333333333,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "term-3",
+      "cluster": "termination-without-reason",
+      "question": "Do I need a valid reason to terminate a worker's contract?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "111",
+        "109"
+      ],
+      "retrieved": [
+        "Somalia Labour Code ·  46-47 (score 0.0167)",
+        "Somalia Labour Code · 109, 111 (score 0.0164)",
+        "Somalia Labour Code · 46 (score 0.0161)",
+        "Somalia Labour Code · 116 (score 0.0159)",
+        "Somalia Labour Code · 110 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 1,
+      "hit1": false,
+      "hit3": true,
+      "mrr": 0.5,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "term-4",
+      "cluster": "termination-without-reason",
+      "question": "What happens if I sack an employee for no reason?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "111",
+        "109"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 103 (score 0.0167)",
+        "Somalia Labour Code · 109, 111 (score 0.0164)",
+        "Somalia Labour Code ·  3-5 (score 0.0161)",
+        "Somalia Labour Code · 136, 140 (score 0.0159)",
+        "Income Tax Act 2025 · ITR 2025 · Regs. 90-1, 90-2, 105-8 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 1,
+      "hit1": false,
+      "hit3": true,
+      "mrr": 0.5,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "term-5",
+      "cluster": "termination-without-reason",
+      "question": "Can an employer just let someone go without cause?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "111",
+        "109"
+      ],
+      "retrieved": [
+        "Income Tax Act 2025 · ITR 2025 · Regs. 90-1, 90-2, 105-8 (score 0.0167)",
+        "Somalia Labour Code · 47, 48 (score 0.0164)",
+        "Somalia Labour Code · 109, 111 (score 0.0161)",
+        "Somalia Labour Code · 85 (score 0.0159)",
+        "Somalia Labour Code · 48, 49 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 2,
+      "hit1": false,
+      "hit3": true,
+      "mrr": 0.3333333333333333,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "mat-1",
+      "cluster": "maternity-leave",
+      "question": "Is maternity leave paid or unpaid in Somalia?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "129"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 129 (score 0.0167)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 79 (score 0.0164)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 77(2)–(4) (score 0.0161)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 77 (score 0.0159)",
+        "Somalia Labour Code · 69 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "mat-2",
+      "cluster": "maternity-leave",
+      "question": "How many weeks of maternity leave do I get?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "129"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 129 (score 0.0167)",
+        "Somalia Labour Code · 117, 129 (score 0.0164)",
+        "Somalia Labour Code · 69 (score 0.0161)",
+        "Somalia Labour Code · 69 (score 0.0159)",
+        "Somalia Labour Code · 62-63 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "mat-3",
+      "cluster": "maternity-leave",
+      "question": "Does a pregnant employee get paid time off before giving birth?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "129"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 3 (score 0.0167)",
+        "Somalia Labour Code · 103 (score 0.0164)",
+        "Somalia Labour Code · 80 (score 0.0161)",
+        "Somalia Labour Code · 129 (score 0.0159)",
+        "Somalia Labour Code · 65 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 3,
+      "hit1": false,
+      "hit3": false,
+      "mrr": 0.25,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "mat-4",
+      "cluster": "maternity-leave",
+      "question": "What are the rules for maternity leave under the Labour Code?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "129"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 129 (score 0.0167)",
+        "Somalia Labour Code · 207-210 (score 0.0164)",
+        "Somalia Labour Code · 117, 129 (score 0.0161)",
+        "Somalia Labour Code · 69 (score 0.0159)",
+        "Somalia Labour Code · 69 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "mat-5",
+      "cluster": "maternity-leave",
+      "question": "Can a woman be fired while on maternity leave?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "129"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 129 (score 0.0167)",
+        "Somalia Labour Code · 117, 129 (score 0.0164)",
+        "Somalia Labour Code · 110 (score 0.0161)",
+        "Somalia Labour Code · 69 (score 0.0159)",
+        "Somalia Labour Code · 69 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "expr-1",
+      "cluster": "expropriation-protection",
+      "question": "Can the government seize my foreign investment?",
+      "expectedLaw": "Foreign Investment Law",
+      "expectedArticles": [
+        "18"
+      ],
+      "retrieved": [
+        "Foreign Investment Law · Art. 18 (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "expr-2",
+      "cluster": "expropriation-protection",
+      "question": "Is my investment protected from nationalisation?",
+      "expectedLaw": "Foreign Investment Law",
+      "expectedArticles": [
+        "18"
+      ],
+      "retrieved": [
+        "Foreign Investment Law · Arts. 12, 13, 15, 17, 18, 19, 24 (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "expr-3",
+      "cluster": "expropriation-protection",
+      "question": "What compensation am I owed if the state takes my business?",
+      "expectedLaw": "Foreign Investment Law",
+      "expectedArticles": [
+        "18"
+      ],
+      "retrieved": [
+        "Income Tax Act 2025 · ITA 2025 · Art. 23 (score 0.0167)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 13 (score 0.0164)",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 12, 13, 14 (score 0.0161)",
+        "Somalia Labour Code · 136, 140 (score 0.0159)",
+        "Environmental Law · EPMA 2024 · Arts. 3, 17(5), 88–89 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": -1,
+      "hit1": false,
+      "hit3": false,
+      "mrr": 0,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "expr-4",
+      "cluster": "expropriation-protection",
+      "question": "Can Somalia expropriate a foreign-owned company?",
+      "expectedLaw": "Foreign Investment Law",
+      "expectedArticles": [
+        "18"
+      ],
+      "retrieved": [
+        "Foreign Investment Law · Arts. 12, 13, 15, 17, 18, 19, 24 (score 0.0167)",
+        "Foreign Investment Law · Art. 1(1) (score 0.0164)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 77(2)–(4) (score 0.0161)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 79 (score 0.0159)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 86 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "expr-5",
+      "cluster": "expropriation-protection",
+      "question": "What legal protection exists against government seizure of assets?",
+      "expectedLaw": "Foreign Investment Law",
+      "expectedArticles": [
+        "18"
+      ],
+      "retrieved": [
+        "Data Protection Law · Data Protection Act · Art. 3 (score 0.0167)",
+        "Data Protection Law · Data Protection Act · Art. 34 (score 0.0164)",
+        "Data Protection Law · Data Protection Act · Arts. 6–10, 13 (score 0.0161)",
+        "Environmental Law · EPMA 2024 · Art. 73 (score 0.0159)",
+        "Data Protection Law · Data Protection Act · Art. 7 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": -1,
+      "hit1": false,
+      "hit3": false,
+      "mrr": 0,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "ptr-1",
+      "cluster": "presumptive-tax",
+      "question": "What is the Presumptive Tax Regime and who qualifies?",
+      "expectedLaw": "Income Tax Act 2025",
+      "expectedArticles": [
+        "9",
+        "97"
+      ],
+      "retrieved": [
+        "Income Tax Act 2025 · ITA 2025 · Art. 9 (score 0.0167)",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 97 & 101 (score 0.0164)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 9; ITR 2025 · Reg. 9-1, 9-2 (score 0.0161)",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 90–95 (score 0.0159)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 86 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "ptr-2",
+      "cluster": "presumptive-tax",
+      "question": "Can a small trader pay a flat tax instead of filing full accounts?",
+      "expectedLaw": "Income Tax Act 2025",
+      "expectedArticles": [
+        "9",
+        "97"
+      ],
+      "retrieved": [
+        "Income Tax Act 2025 · Revenue Administration Law (score 0.0167)",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 97 & 101 (score 0.0164)",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 90–95 (score 0.0161)",
+        "Income Tax Act 2025 · ITR 2025 · Regs. 90-1, 90-2, 105-8 (score 0.0159)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 86 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 1,
+      "hit1": false,
+      "hit3": true,
+      "mrr": 0.5,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "ptr-3",
+      "cluster": "presumptive-tax",
+      "question": "How is tax calculated for a sole trader under PTR?",
+      "expectedLaw": "Income Tax Act 2025",
+      "expectedArticles": [
+        "9",
+        "97"
+      ],
+      "retrieved": [
+        "Income Tax Act 2025 · ITA 2025 · Art. 9; ITR 2025 · Reg. 9-1, 9-2 (score 0.0167)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 86 (score 0.0164)",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 97 & 101 (score 0.0161)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 9 (score 0.0159)",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 90–95 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "ptr-4",
+      "cluster": "presumptive-tax",
+      "question": "Is there a simplified tax option for businesses under USD 50,000 turnover?",
+      "expectedLaw": "Income Tax Act 2025",
+      "expectedArticles": [
+        "9",
+        "97"
+      ],
+      "retrieved": [
+        "Income Tax Act 2025 · ITA 2025 · Art. 97 (score 0.0167)",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 5, 7, 9, 10 (score 0.0164)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 9; ITR 2025 · Reg. 9-1, 9-2 (score 0.0161)",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 6, 39 (score 0.0159)",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 3, 60, 61 (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "ptr-5",
+      "cluster": "presumptive-tax",
+      "question": "Which professionals are excluded from the presumptive tax regime?",
+      "expectedLaw": "Income Tax Act 2025",
+      "expectedArticles": [
+        "9",
+        "97"
+      ],
+      "retrieved": [
+        "Income Tax Act 2025 · ITR 2025 · Reg. 9-2 (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": -1,
+      "hit1": false,
+      "hit3": false,
+      "mrr": 0,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "single-1",
+      "cluster": null,
+      "question": "Is the import and export of charcoal legal in Somalia?",
+      "expectedLaw": "Environmental Law",
+      "expectedArticles": [
+        "48"
+      ],
+      "retrieved": [
+        "Environmental Law · EPMA 2024 · Art. 48(1),(5)–(6) (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "single-2",
+      "cluster": null,
+      "question": "Do I need an environmental impact assessment before starting a project?",
+      "expectedLaw": "Environmental Law",
+      "expectedArticles": [
+        "57",
+        "58"
+      ],
+      "retrieved": [
+        "Environmental Law · EPMA 2024 · Arts. 57–58 (score 0.0167)",
+        "Data Protection Law · Data Protection Act · Art. 29 (score 0.0164)",
+        "Environmental Law · EPMA 2024 · Art. 60 (score 0.0161)",
+        "Environmental Law · EPMA 2024 · Arts. 23–25 (score 0.0159)",
+        "Environmental Law · EPMA 2024 · Art. 57(1)–(3) (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "single-3",
+      "cluster": null,
+      "question": "What must I do if there is a data breach?",
+      "expectedLaw": "Data Protection Law",
+      "expectedArticles": [
+        "25",
+        "26"
+      ],
+      "retrieved": [
+        "Data Protection Law · Data Protection Act · Art. 27 (score 0.0167)",
+        "Data Protection Law · Data Protection Act · Art. 26 (score 0.0164)",
+        "Data Protection Law · Data Protection Act · Arts. 25–26 (score 0.0161)"
+      ],
+      "gate": "weak",
+      "hitRank": 1,
+      "hit1": false,
+      "hit3": true,
+      "mrr": 0.5,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "single-4",
+      "cluster": null,
+      "question": "Do I have the right not to be subject to an automated decision?",
+      "expectedLaw": "Data Protection Law",
+      "expectedArticles": [
+        "23"
+      ],
+      "retrieved": [
+        "Data Protection Law · Data Protection Act · Art. 23 (score 0.0167)",
+        "Data Protection Law · Data Protection Act · Arts. 20–23 (score 0.0164)",
+        "Data Protection Law · Data Protection Act · Art. 18 (score 0.0161)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "single-5",
+      "cluster": null,
+      "question": "What withholding tax rate applies to rental income?",
+      "expectedLaw": "Income Tax Act 2025",
+      "expectedArticles": [
+        "5"
+      ],
+      "retrieved": [
+        "Income Tax Act 2025 · ITA 2025 · First Schedule Art. 5 (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "single-6",
+      "cluster": null,
+      "question": "Who counts as a tax resident of Somalia?",
+      "expectedLaw": "Income Tax Act 2025",
+      "expectedArticles": [
+        "77"
+      ],
+      "retrieved": [
+        "Income Tax Act 2025 · ITA 2025 · Art. 77(2)–(4) (score 0.0167)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 77 (score 0.0164)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 59 (score 0.0161)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 77 (score 0.0159)",
+        "Income Tax Act 2025 · ITA 2025 · First Schedule (score 0.0156)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "single-7",
+      "cluster": null,
+      "question": "Can I take my profits out of Somalia freely?",
+      "expectedLaw": "Foreign Investment Law",
+      "expectedArticles": [
+        "12"
+      ],
+      "retrieved": [
+        "Foreign Investment Law · Art. 12 (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "single-8",
+      "cluster": null,
+      "question": "How long before I can take my original capital out of Somalia?",
+      "expectedLaw": "Foreign Investment Law",
+      "expectedArticles": [
+        "13"
+      ],
+      "retrieved": [
+        "Foreign Investment Law · Art. 13 (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "single-9",
+      "cluster": null,
+      "question": "What is the maximum number of hours an employee can work per week?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "62",
+        "63"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 62-63 (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": -1,
+      "hit1": false,
+      "hit3": false,
+      "mrr": 0,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "single-10",
+      "cluster": null,
+      "question": "Is an employer required to provide a payslip?",
+      "expectedLaw": "Somalia Labour Code",
+      "expectedArticles": [
+        "80"
+      ],
+      "retrieved": [
+        "Somalia Labour Code · 80 (score 0.0167)"
+      ],
+      "gate": "weak",
+      "hitRank": 0,
+      "hit1": true,
+      "hit3": true,
+      "mrr": 1,
+      "pass": false,
+      "reason": "gate=weak — below supported threshold"
+    },
+    {
+      "id": "oos-1",
+      "question": "What is the speed limit in Mogadishu?",
+      "expectedLaw": null,
+      "expectedArticles": [],
+      "retrieved": [
+        "Data Protection Law · Data Protection Act · Arts. 30–31",
+        "Data Protection Law · Data Protection Act · Art. 15",
+        "Income Tax Act 2025 · ITA 2025 · Art. 23",
+        "Income Tax Act 2025 · ITA 2025 · Art. 65",
+        "Income Tax Act 2025 · ITA 2025 · Art. 13"
+      ],
+      "gate": "weak",
+      "pass": false,
+      "reason": "expected gate=none but got gate=weak"
+    },
+    {
+      "id": "oos-2",
+      "question": "How do I get a divorce in Somalia?",
+      "expectedLaw": null,
+      "expectedArticles": [],
+      "retrieved": [
+        "Income Tax Act 2025 · ITA 2025 · Art. 79",
+        "Income Tax Act 2025 · ITA 2025 · Art. 77(2)–(4)",
+        "Income Tax Act 2025 · ITA 2025 · Art. 77",
+        "Income Tax Act 2025 · ITA 2025 · Art. 77",
+        "Foreign Investment Law · Art. 1(1)"
+      ],
+      "gate": "weak",
+      "pass": false,
+      "reason": "expected gate=none but got gate=weak"
+    },
+    {
+      "id": "oos-3",
+      "question": "What is the capital gains tax rate in the United States?",
+      "expectedLaw": null,
+      "expectedArticles": [],
+      "retrieved": [
+        "Income Tax Act 2025 · ITA 2025 · Arts. 100 & First Schedule Art. 5",
+        "Income Tax Act 2025 · ITA 2025 · First Schedule",
+        "Income Tax Act 2025 · ITA 2025 · First Schedule Arts. 2 & 3",
+        "Income Tax Act 2025 · ITA 2025 · Arts. 6, 39",
+        "Income Tax Act 2025 · ITA 2025 · Art. 39; ITR 2025 · Reg. 6-1"
+      ],
+      "gate": "weak",
+      "pass": false,
+      "reason": "expected gate=none but got gate=weak"
+    },
+    {
+      "id": "oos-4",
+      "question": "How do I renew my Somali passport?",
+      "expectedLaw": null,
+      "expectedArticles": [],
+      "retrieved": [
+        "Income Tax Act 2025 · ITA 2025 · Art. 79",
+        "Income Tax Act 2025 · ITA 2025 · Art. 86",
+        "Somalia Labour Code · 46",
+        "Income Tax Act 2025 · ITA 2025 · Art. 86",
+        "Foreign Investment Law · Arts. 4(f), 17"
+      ],
+      "gate": "weak",
+      "pass": false,
+      "reason": "expected gate=none but got gate=weak"
+    },
+    {
+      "id": "oos-5",
+      "question": "What is the weather like in Mogadishu today?",
+      "expectedLaw": null,
+      "expectedArticles": [],
+      "retrieved": [
+        "Data Protection Law · Data Protection Act · Arts. 25–26",
+        "Environmental Law · EPMA 2024 · Art. 49(3),(5)",
+        "Environmental Law · EPMA 2024 · Art. 50",
+        "Data Protection Law · Data Protection Act · Art. 18",
+        "Data Protection Law · Data Protection Act · Art. 26"
+      ],
+      "gate": "weak",
+      "pass": false,
+      "reason": "expected gate=none but got gate=weak"
+    }
+  ]
+}
