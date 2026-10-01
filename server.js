@@ -553,6 +553,65 @@ app.post('/suggest', async (req, res) => {
   return res.json({ ok: true });
 });
 
+/* ─────────────────────────────────────────────
+   NEWSLETTER / EARLY-ACCESS SUBSCRIBE  (Mailchimp)
+   Frontend posts { email, source } to /subscribe.
+   Needs env: MAILCHIMP_API_KEY (e.g. xxxxxxxx-us13), MAILCHIMP_LIST_ID
+   New subscribers get a double opt-in email (status_if_new: 'pending').
+───────────────────────────────────────────── */
+const subscribeHits = new Map(); // ip -> [timestamps]
+const SUBSCRIBE_LIMIT = 10;                 // per IP
+const SUBSCRIBE_WINDOW_MS = 60 * 60 * 1000; // per hour
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, ts] of subscribeHits) {
+    const recent = ts.filter(t => now - t < SUBSCRIBE_WINDOW_MS);
+    if (recent.length) subscribeHits.set(ip, recent); else subscribeHits.delete(ip);
+  }
+}, 10 * 60 * 1000).unref();
+
+app.post('/subscribe', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (email.length > 200 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
+    return res.status(400).json({ error: 'Valid email required' });
+
+  const ip = req.ip || 'unknown';
+  const now = Date.now();
+  const recent = (subscribeHits.get(ip) || []).filter(t => now - t < SUBSCRIBE_WINDOW_MS);
+  if (recent.length >= SUBSCRIBE_LIMIT) return res.status(429).json({ error: 'Too many attempts. Please try again later.' });
+  recent.push(now);
+  subscribeHits.set(ip, recent);
+
+  const key = process.env.MAILCHIMP_API_KEY || '';
+  const list = process.env.MAILCHIMP_LIST_ID || '';
+  const dc = key.split('-')[1];
+  if (!key || !list || !dc) {
+    console.error('Subscribe: MAILCHIMP_API_KEY / MAILCHIMP_LIST_ID not configured');
+    return res.status(500).json({ error: 'Newsletter is not configured' });
+  }
+
+  const hash = crypto.createHash('md5').update(email).digest('hex');
+  try {
+    const r = await fetch(`https://${dc}.api.mailchimp.com/3.0/lists/${list}/members/${hash}`, {
+      method: 'PUT',
+      headers: {
+        Authorization: 'Basic ' + Buffer.from('xeerhub:' + key).toString('base64'),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ email_address: email, status_if_new: 'pending' }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      console.error('Mailchimp error:', r.status, body.title || '', body.detail || '');
+      return res.status(502).json({ error: 'Subscription failed. Please try again.' });
+    }
+    return res.json({ status: body.status === 'subscribed' ? 'subscribed' : 'pending' });
+  } catch (e) {
+    console.error('Subscribe error:', e.message);
+    return res.status(500).json({ error: 'Server error. Please try again.' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`XeerHub API running on port ${PORT}`);
 });
